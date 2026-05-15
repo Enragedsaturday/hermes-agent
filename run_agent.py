@@ -3859,7 +3859,6 @@ class AIAgent:
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force,
         )
-
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
