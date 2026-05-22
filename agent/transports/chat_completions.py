@@ -135,6 +135,7 @@ class ChatCompletionsTransport(ProviderTransport):
             if (
                 "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
+                or "codex_compaction_items" in msg
                 or "tool_name" in msg
             ):
                 needs_sanitize = True
@@ -160,6 +161,7 @@ class ChatCompletionsTransport(ProviderTransport):
             msg.pop("codex_reasoning_items", None)
             msg.pop("codex_message_items", None)
             msg.pop("tool_name", None)
+            msg.pop("codex_compaction_items", None)
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
