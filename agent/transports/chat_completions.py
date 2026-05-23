@@ -160,8 +160,8 @@ class ChatCompletionsTransport(ProviderTransport):
                 continue
             msg.pop("codex_reasoning_items", None)
             msg.pop("codex_message_items", None)
-            msg.pop("tool_name", None)
             msg.pop("codex_compaction_items", None)
+            msg.pop("tool_name", None)
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:

@@ -262,18 +262,19 @@ def _get_loop(*, allow_during_shutdown: bool = False) -> asyncio.AbstractEventLo
 
 def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT, *, allow_during_shutdown: bool = False):
     """Schedule *coro* on the shared loop and block until done."""
-    from agent.async_utils import safe_schedule_threadsafe
     if _PROCESS_SHUTTING_DOWN.is_set() and not allow_during_shutdown:
         _close_coroutine(coro)
         raise RuntimeError("Hindsight is shutting down; refusing async operation")
+    from agent.async_utils import safe_schedule_threadsafe
     try:
         loop = _get_loop(allow_during_shutdown=allow_during_shutdown)
+        future = safe_schedule_threadsafe(coro, loop)
+        if future is None:
+            _close_coroutine(coro)
+            raise RuntimeError("Hindsight loop unavailable")
     except RuntimeError:
         _close_coroutine(coro)
         raise
-    future = safe_schedule_threadsafe(coro, loop)
-    if future is None:
-        raise RuntimeError("Hindsight loop unavailable")
     return future.result(timeout=timeout)
 
 

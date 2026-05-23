@@ -786,7 +786,8 @@ class TestAuxModelFallbackSurfacedToCallers:
 
 
 class TestSummaryFailureTrackingForGatewayWarning:
-    """When summary generation fails, preserve context instead of dropping middle messages."""
+    """When summary generation fails, the compressor must preserve context
+    instead of dropping middle messages behind a placeholder."""
 
     def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):

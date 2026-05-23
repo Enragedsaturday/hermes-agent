@@ -248,7 +248,7 @@ def _normalize_codex_opaque_item(item: Dict[str, Any], *, seen_ids: Optional[set
     """Normalize replayable opaque Codex Responses state.
 
     Reasoning and compaction_summary items carry encrypted_content blobs that
-    are self-contained for replay. Strip IDs because store=False cannot resolve
+    are self-contained for replay.  Strip IDs because store=False cannot resolve
     them server-side; use IDs only for local deduplication.
     """
     item_type = item.get("type")
@@ -288,15 +288,14 @@ def _chat_messages_to_responses_input(
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
-    Native Codex accepts replayed encrypted reasoning and compaction_summary
-    state. ``is_xai_responses`` is kept for transport signature compatibility
-    but no longer suppresses encrypted reasoning replay. Earlier (PR #26644,
+    ``is_xai_responses`` is kept for transport signature compatibility but
+    no longer suppresses encrypted reasoning replay.  Earlier (PR #26644,
     May 2026) we believed xAI's OAuth/SuperGrok ``/v1/responses`` surface
     rejected replayed ``encrypted_content`` reasoning items minted by prior
-    turns, and we stripped them. That decision was wrong — xAI explicitly
-    relies on Hermes threading encrypted reasoning back across turns for
-    cross-turn coherence. Replay opaque state on every Responses transport
-    and let a provider-specific surface fail explicitly if that ever changes.
+    turns, and we stripped them.  That decision was wrong: xAI relies on
+    Hermes threading encrypted reasoning back across turns for cross-turn
+    coherence.  Replay encrypted reasoning and native Codex compaction items
+    on every Responses transport unless a backend explicitly rejects them.
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
@@ -321,10 +320,8 @@ def _chat_messages_to_responses_input(
                 content_text = str(content) if content is not None else ""
 
             if role == "assistant":
-                # Replay encrypted reasoning and compaction items from previous
-                # turns so Responses transports can maintain coherent opaque
-                # state. This applies to native Codex and xAI; keep
-                # ``is_xai_responses`` only for caller signature compatibility.
+                # Replay encrypted reasoning and compaction items from
+                # previous turns so the API can maintain coherent state.
                 has_opaque_codex_state = False
                 for field_name in ("codex_reasoning_items", "codex_compaction_items"):
                     raw_items = msg.get(field_name)

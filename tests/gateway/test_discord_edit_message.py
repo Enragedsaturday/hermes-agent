@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.discord import DiscordAdapter
-import gateway.platforms.discord as discord_platform
+from plugins.platforms.discord.adapter import DiscordAdapter
+from plugins.platforms.discord import adapter as discord_platform
 
 
 @pytest.mark.asyncio

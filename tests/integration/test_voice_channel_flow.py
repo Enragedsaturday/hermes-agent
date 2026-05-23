@@ -62,7 +62,7 @@ except Exception:
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from gateway.platforms import discord as discord_platform
+from plugins.platforms.discord import adapter as discord_platform
 
 discord_platform.discord = discord
 VoiceReceiver = discord_platform.VoiceReceiver
