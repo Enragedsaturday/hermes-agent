@@ -69,6 +69,19 @@ class TestCompress:
         result = compressor.compress(msgs)
         assert result == msgs
         assert compressor.compression_count == 0
+        assert compressor._last_compress_aborted is False
+        assert compressor._last_summary_fallback_used is False
+        assert compressor._last_summary_dropped_count == 0
+
+    def test_summary_failure_preserves_context_when_call_llm_fails(self, compressor):
+        # Simulate "no summarizer available" explicitly. call_llm can otherwise
+        # discover the developer's real auxiliary credentials from auth state.
+        msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+            result = compressor.compress(msgs)
+        assert result == msgs
+        assert compressor.compression_count == 0
+        assert compressor._last_compress_aborted is False
         assert compressor._last_summary_fallback_used is False
         assert compressor._last_summary_dropped_count == 0
 
