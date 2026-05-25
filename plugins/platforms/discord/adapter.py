@@ -648,6 +648,27 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         return self._csv_env_set("DISCORD_BOT_CONTROL_CHANNELS")
 
+    def _discord_approval_notify_mentions(self) -> list[str]:
+        """Raw Discord mentions to include in command-approval prompts.
+
+        Button approvals work for humans, but supervisor bots cannot click
+        Discord components. In bot-to-bot PM setups the approval prompt itself
+        must raw-mention the supervisor bot so the receiving gateway admits the
+        message under ``DISCORD_ALLOW_BOTS=mentions``. Keep this env-driven so
+        ordinary single-bot deployments do not gain noisy mentions.
+        """
+        raw = (
+            os.getenv("DISCORD_APPROVAL_NOTIFY_MENTIONS")
+            or os.getenv("DISCORD_OPERATOR_MENTIONS")
+            or ""
+        )
+        mentions: list[str] = []
+        for item in re.split(r"[,\s]+", raw):
+            item = item.strip()
+            if item and item not in mentions:
+                mentions.append(item)
+        return mentions
+
     def _message_channel_ids(self, message: Any) -> set[str]:
         channel_ids = {str(message.channel.id)}
         parent_channel_id = None
@@ -4325,13 +4346,30 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             embed.add_field(name="Reason", value=description, inline=False)
 
+            self_mention = ""
+            try:
+                if self._client and self._client.user:
+                    self_mention = f"<@{self._client.user.id}>"
+            except Exception:
+                self_mention = ""
+            notify_mentions = self._discord_approval_notify_mentions()
+            content_lines = []
+            if notify_mentions:
+                content_lines.append(" ".join(notify_mentions) + " approval required")
+            if self_mention:
+                content_lines.append(
+                    f"Galt/another supervisor bot can approve by replying in this same thread/session with `{self_mention} /approve` "
+                    f"or deny with `{self_mention} /deny`."
+                )
+            content = "\n".join(content_lines) or None
+
             view = ExecApprovalView(
                 session_key=session_key,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
             )
 
-            msg = await channel.send(embed=embed, view=view)
+            msg = await channel.send(content=content, embed=embed, view=view)
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
