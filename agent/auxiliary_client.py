@@ -107,6 +107,32 @@ from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_
 logger = logging.getLogger(__name__)
 
 
+def _responses_null_output_iterable_error(exc: BaseException) -> bool:
+    """True when the OpenAI SDK trips over terminal response.output=None."""
+    text = str(exc)
+    return isinstance(exc, TypeError) and "NoneType" in text and "not iterable" in text
+
+
+def _responses_backfilled_response(output_items: List[Any], text_parts: List[str], *, has_function_calls: bool, model: str = None) -> Optional[Any]:
+    """Build a minimal Responses-like object from already streamed events."""
+    if output_items:
+        return SimpleNamespace(output=list(output_items), usage=None, status="completed", model=model)
+    if text_parts and not has_function_calls:
+        assembled = "".join(text_parts)
+        return SimpleNamespace(
+            output=[SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text=assembled)],
+            )],
+            usage=None,
+            status="completed",
+            model=model,
+        )
+    return None
+
+
 def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
     """Return False instead of raising when a patched symbol is not a type."""
     try:
@@ -796,44 +822,61 @@ class _CodexCompletionsAdapter:
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
+            final = None
             with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
+                try:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
                     _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
+                    final = stream.get_final_response()
+                except TypeError as exc:
+                    if not _responses_null_output_iterable_error(exc):
+                        raise
+                    final = _responses_backfilled_response(
+                        collected_output_items,
+                        collected_text_deltas,
+                        has_function_calls=has_function_calls,
+                        model=resp_kwargs.get("model"),
+                    )
+                    if final is None:
+                        raise
+                    logger.warning(
+                        "Codex auxiliary Responses stream parser hit response.output=None; "
+                        "recovered from streamed events (items=%d, text_parts=%d)",
+                        len(collected_output_items),
+                        len(collected_text_deltas),
+                    )
+
+            if final is None:
+                raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
-                if collected_output_items:
-                    final.output = list(collected_output_items)
-                    logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
+            if _output is None or (isinstance(_output, list) and not _output):
+                recovered = _responses_backfilled_response(
+                    collected_output_items,
+                    collected_text_deltas,
+                    has_function_calls=has_function_calls,
+                    model=resp_kwargs.get("model"),
+                )
+                if recovered is not None:
+                    final.output = recovered.output
+                    logger.warning(
+                        "Codex auxiliary: backfilled missing output from stream events "
+                        "(items=%d, text_parts=%d)",
                         len(collected_output_items),
-                    )
-                elif collected_text_deltas and not has_function_calls:
-                    # Only synthesize text when no tool calls were streamed —
-                    # a function_call response with incidental text should not
-                    # be collapsed into a plain-text message.
-                    assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
-                    logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
+                        len(collected_text_deltas),
                     )
 
             # Extract text and tool calls from the Responses output.
@@ -921,6 +964,105 @@ class CodexAuxiliaryClient:
 
     def close(self):
         self._real_client.close()
+
+    @staticmethod
+    def _extract_compact_output(data: Any) -> List[Dict[str, Any]]:
+        if isinstance(data, list):
+            raw_items = data
+        elif isinstance(data, dict):
+            raw_items = data.get("output") or data.get("items") or data.get("input") or []
+        else:
+            raw_items = getattr(data, "output", None) or getattr(data, "items", None) or []
+        if not isinstance(raw_items, list):
+            return []
+
+        compact_items: List[Dict[str, Any]] = []
+        for item in raw_items:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(exclude_none=True)
+            elif not isinstance(item, dict):
+                item = getattr(item, "__dict__", None)
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                normalized_content = []
+                for part in content:
+                    if hasattr(part, "model_dump"):
+                        part = part.model_dump(exclude_none=True)
+                    elif not isinstance(part, dict):
+                        part = getattr(part, "__dict__", None)
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type")
+                    if ptype not in {"output_text", "text"}:
+                        continue
+                    text = part.get("text", "")
+                    if text is None:
+                        text = ""
+                    if not isinstance(text, str):
+                        text = str(text)
+                    normalized_content.append({"type": "output_text", "text": text})
+                if not normalized_content:
+                    continue
+                compact_items.append({
+                    "type": "message",
+                    "role": item.get("role") or "assistant",
+                    "status": item.get("status") or "completed",
+                    "content": normalized_content,
+                })
+                continue
+            if item_type in {"compaction_summary", "reasoning"}:
+                encrypted = item.get("encrypted_content")
+                if not isinstance(encrypted, str) or not encrypted:
+                    continue
+                compact_items.append({
+                    "type": item_type,
+                    "encrypted_content": encrypted,
+                })
+        return compact_items
+
+    def compact_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+        focus_topic: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run native Codex Responses compaction and return replayable items."""
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        instructions = "Compact this conversation for later continuation."
+        if focus_topic:
+            instructions += f" Preserve details related to this focus topic: {focus_topic}"
+        input_items = _chat_messages_to_responses_input(messages)
+        body = {
+            "model": model or self.chat.completions._model,
+            "instructions": instructions,
+            "input": input_items or [{"role": "user", "content": ""}],
+        }
+
+        post_kwargs: Dict[str, Any] = {"body": body}
+        if timeout is not None:
+            try:
+                from openai._base_client import make_request_options
+                post_kwargs["options"] = make_request_options(timeout=timeout)
+            except Exception:
+                post_kwargs["timeout"] = timeout
+        try:
+            import httpx
+            response = self._real_client.post("/responses/compact", cast_to=httpx.Response, **post_kwargs)
+        except TypeError:
+            # Test doubles and some SDK-compatible clients use a simpler post signature.
+            response = self._real_client.post("/responses/compact", **post_kwargs)
+        if hasattr(response, "raise_for_status"):
+            response.raise_for_status()
+        data = response.json() if hasattr(response, "json") else response
+        return self._extract_compact_output(data)
 
 
 class _AsyncCodexCompletionsAdapter:
@@ -4052,7 +4194,7 @@ def resolve_vision_provider_client(
 
 def get_auxiliary_extra_body() -> dict:
     """Return extra_body kwargs for auxiliary API calls.
-    
+
     Includes Nous Portal product tags when the auxiliary client is backed
     by Nous Portal. Returns empty dict otherwise.
     """
@@ -4061,7 +4203,7 @@ def get_auxiliary_extra_body() -> dict:
 
 def auxiliary_max_tokens_param(value: int) -> dict:
     """Return the correct max tokens kwarg for the auxiliary client's provider.
-    
+
     OpenRouter and local models use 'max_tokens'. Direct OpenAI with newer
     models (gpt-4o, o-series, gpt-5+) requires 'max_completion_tokens'.
     The Codex adapter translates max_tokens internally, so we use max_tokens
