@@ -2755,6 +2755,14 @@ class BasePlatformAdapter(ABC):
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
 
+    def _is_terminal_send_error(self, error: Optional[str]) -> bool:
+        """Return True for platform-specific send failures that must not retry or fallback.
+
+        Platform adapters override this for protocol guards where retrying or
+        wrapping the original payload would repeat the same invalid side effect.
+        """
+        return False
+
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
 
@@ -2811,6 +2819,10 @@ class BasePlatformAdapter(ABC):
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):
+            return result
+
+        if self._is_terminal_send_error(error_str):
+            logger.error("[%s] Terminal send rejection: %s", self.name, error_str)
             return result
 
         if is_network:

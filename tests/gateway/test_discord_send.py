@@ -304,6 +304,49 @@ async def test_send_bot_message_builds_valid_protocol_envelope(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_bot_message_disables_replied_user_ping(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_BOT_USERS", "777")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    allowed_mentions_seen = []
+
+    class FakeAllowedMentions:
+        def __init__(self, *, everyone, roles, users, replied_user):
+            self.everyone = everyone
+            self.roles = roles
+            self.users = users
+            self.replied_user = replied_user
+
+    async def fake_send(*, content, reference=None, allowed_mentions=None):
+        allowed_mentions_seen.append(allowed_mentions)
+        return SimpleNamespace(id=1234)
+
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(return_value=SimpleNamespace(id=99, to_reference=MagicMock(return_value=object()))),
+        send=AsyncMock(side_effect=fake_send),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    import gateway.platforms.discord as discord_platform
+    discord_platform.discord.AllowedMentions = FakeAllowedMentions
+
+    result = await adapter.send_bot_message(
+        "555",
+        recipient_bot_id="777",
+        body="structured body",
+        reply_expected=True,
+        kind="status",
+        correlation_id="corr-1",
+        reply_to="99",
+    )
+
+    assert result.success is True
+    assert allowed_mentions_seen
+    assert allowed_mentions_seen[0].replied_user is False
+
+
+@pytest.mark.asyncio
 async def test_send_bot_message_rejects_oversized_protocol_envelope_before_chunking(monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOWED_BOT_USERS", "777")
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))

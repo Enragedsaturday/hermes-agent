@@ -72,6 +72,21 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
 )
 from tools.url_safety import is_safe_url
+from .bot_msg_protocol import (
+    DISCORD_BOT_MSG_KINDS as _DISCORD_BOT_MSG_KINDS,
+    DISCORD_BOT_MSG_CORRELATION_RE as _DISCORD_BOT_MSG_CORRELATION_RE,
+    DISCORD_BOT_MSG_PROTOCOL_VERSION as _DISCORD_BOT_MSG_PROTOCOL_VERSION,
+    bot_msg_required_error,
+    build_discord_bot_msg_v1,
+    discord_bot_msg_max_body_chars,
+    discord_bot_msg_protocol_version,
+    discord_bot_reply_false_reaction,
+    discord_content_mentioned_allowed_bots,
+    discord_content_mentions_allowed_bot,
+    discord_mention_id,
+    is_bot_msg_required_error,
+    parse_discord_bot_msg_v1,
+)
 
 
 def _find_discord_windows_bundled_opus(discord_module: Any = None) -> Optional[str]:
@@ -150,31 +165,18 @@ def _has_raw_user_mention(content: str, user_id: Any) -> bool:
     return f"<@{sid}>" in content or f"<@!{sid}>" in content
 
 
-_DISCORD_BOT_MSG_KINDS = {
-    "status",
-    "action_required",
-    "approval_request",
-    "decision_request",
-    "handoff",
-    "review_request",
-    "audit",
-}
-_DISCORD_BOT_MSG_CORRELATION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-_DISCORD_BOT_MSG_PROTOCOL_VERSION = "v1"
-
 
 def _discord_bot_reply_false_reaction() -> str:
     """Reaction used to acknowledge BOT_MSG v1 messages that need no reply."""
-    return (os.getenv("DISCORD_BOT_REPLY_FALSE_REACTION", "👀") or "👀").strip() or "👀"
+    return discord_bot_reply_false_reaction()
 
 
 def _discord_bot_msg_protocol_version() -> str:
-    return (os.getenv("DISCORD_BOT_MSG_PROTOCOL", _DISCORD_BOT_MSG_PROTOCOL_VERSION) or "").strip()
+    return discord_bot_msg_protocol_version()
 
 
 def _discord_mention_id(mention: str) -> Optional[str]:
-    match = re.fullmatch(r"<@!?(\d+)>", (mention or "").strip())
-    return match.group(1) if match else None
+    return discord_mention_id(mention)
 
 
 def _build_discord_bot_msg_v1(
@@ -185,22 +187,12 @@ def _build_discord_bot_msg_v1(
     kind: str,
     correlation_id: str,
 ) -> str:
-    if kind not in _DISCORD_BOT_MSG_KINDS:
-        raise ValueError(f"Invalid BOT_MSG v1 kind: {kind}")
-    if not _DISCORD_BOT_MSG_CORRELATION_RE.fullmatch(correlation_id or ""):
-        raise ValueError("Invalid BOT_MSG v1 correlation_id")
-    if kind != "status" and body == "":
-        raise ValueError("BOT_MSG v1 body is required for non-status kinds")
-    return "\n".join(
-        [
-            f"<@{recipient_bot_id}>",
-            "BOT_MSG v1",
-            f"reply_expected: {'true' if reply_expected else 'false'}",
-            f"kind: {kind}",
-            f"correlation_id: {correlation_id}",
-            "---",
-            body or "",
-        ]
+    return build_discord_bot_msg_v1(
+        recipient_bot_id=recipient_bot_id,
+        body=body,
+        reply_expected=reply_expected,
+        kind=kind,
+        correlation_id=correlation_id,
     )
 
 
@@ -210,68 +202,16 @@ def _parse_discord_bot_msg_v1(content: str, recipient_bot_id: Any) -> Optional[D
     Header grammar is deliberately narrow. Body lines are opaque and may
     contain strings that look like protocol headers.
     """
-    sid = str(recipient_bot_id or "")
-    if not sid:
-        return None
-    text = (content or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = text.split("\n")
-    if len(lines) < 6:
-        return None
-
-    def h(line: str) -> str:
-        return line.strip(" \t")
-
-    mention = h(lines[0])
-    if mention not in {f"<@{sid}>", f"<@!{sid}>"}:
-        return None
-    if h(lines[1]) != "BOT_MSG v1":
-        return None
-
-    expected_fields = ["reply_expected", "kind", "correlation_id"]
-    values: Dict[str, str] = {}
-    for idx, field in enumerate(expected_fields, start=2):
-        line = h(lines[idx])
-        prefix = f"{field}:"
-        if not line.startswith(prefix):
-            return None
-        values[field] = line[len(prefix):].strip(" \t")
-
-    if values["reply_expected"] not in {"true", "false"}:
-        return None
-    if values["kind"] not in _DISCORD_BOT_MSG_KINDS:
-        return None
-    if not _DISCORD_BOT_MSG_CORRELATION_RE.fullmatch(values["correlation_id"]):
-        return None
-    if h(lines[5]) != "---":
-        return None
-
-    body = "\n".join(lines[6:])
-    if values["kind"] != "status" and body == "":
-        return None
-
-    return {
-        "reply_expected": values["reply_expected"] == "true",
-        "kind": values["kind"],
-        "correlation_id": values["correlation_id"],
-        "body": body,
-    }
+    return parse_discord_bot_msg_v1(content, recipient_bot_id)
 
 
 def _discord_content_mentioned_allowed_bots(content: str, allowed_bot_ids: set[str]) -> list[str]:
     """Return allowed bot IDs raw-mentioned in content, in content order."""
-    if not content or not allowed_bot_ids:
-        return []
-    mentioned: list[str] = []
-    for match in re.finditer(r"<@!?(\d+)>", content):
-        bot_id = match.group(1)
-        if bot_id in allowed_bot_ids and bot_id not in mentioned:
-            mentioned.append(bot_id)
-    return mentioned
+    return discord_content_mentioned_allowed_bots(content, allowed_bot_ids)
 
 
 def _discord_content_mentions_allowed_bot(content: str, allowed_bot_ids: set[str]) -> Optional[str]:
-    mentioned = _discord_content_mentioned_allowed_bots(content, allowed_bot_ids)
-    return mentioned[0] if mentioned else None
+    return discord_content_mentions_allowed_bot(content, allowed_bot_ids)
 
 
 def _build_allowed_mentions(*, replied_user: Optional[bool] = None):
@@ -896,6 +836,25 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         return True
 
+    def _is_terminal_send_error(self, error: Optional[str]) -> bool:
+        """Raw allowlisted-bot mentions must not retry or plain-text fallback."""
+        return is_bot_msg_required_error(error)
+
+    def _should_react_malformed_bot_message(self, message: Any) -> bool:
+        """Return True only for explicit bot-targeted messages with malformed BOT_MSG v1.
+
+        Valid BOT_MSG envelopes can still be rejected for body caps or loop fuses;
+        those are not syntax failures and must not get a ❌ reaction that could be
+        interpreted by a peer bot as a retryable protocol failure.
+        """
+        return bool(
+            self._client
+            and self._client.user
+            and _has_raw_user_mention(message.content, self._client.user.id)
+            and self._is_allowed_bot_user(message.author.id)
+            and _parse_discord_bot_msg_v1(message.content, self._client.user.id) is None
+        )
+
     def _should_accept_bot_message(self, message: Any, allow_bots: str) -> bool:
         if allow_bots == "none":
             return False
@@ -921,6 +880,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 "[%s] Rejecting Discord bot message from %s: malformed or missing BOT_MSG v1 envelope",
                 self.name,
                 message.author.id,
+            )
+            return False
+        max_body_chars = discord_bot_msg_max_body_chars()
+        body_len = len(bot_msg.get("body") or "")
+        if body_len > max_body_chars:
+            logger.warning(
+                "[%s] Rejecting Discord bot message from %s: BOT_MSG v1 body length %s exceeds configured cap %s",
+                self.name,
+                message.author.id,
+                body_len,
+                max_body_chars,
             )
             return False
         if not bot_msg["reply_expected"]:
@@ -1112,14 +1082,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if getattr(message.author, "bot", False):
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
                     if not adapter_self._should_accept_bot_message(message, allow_bots):
-                        if (
-                            allow_bots == "mentions"
-                            and adapter_self._client
-                            and adapter_self._client.user
-                            and _has_raw_user_mention(message.content, adapter_self._client.user.id)
-                            and adapter_self._is_allowed_bot_user(message.author.id)
-                            and _parse_discord_bot_msg_v1(message.content, adapter_self._client.user.id) is None
-                        ):
+                        if adapter_self._should_react_malformed_bot_message(message):
                             try:
                                 await asyncio.wait_for(adapter_self._add_reaction(message, "❌"), timeout=3.0)
                             except asyncio.TimeoutError:
@@ -1827,6 +1790,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
         outbound_metadata = dict(metadata or {})
         outbound_metadata["_discord_bot_msg_v1_internal"] = True
+        outbound_metadata["source_is_bot"] = True
         return await self.send(chat_id, envelope, reply_to=reply_to, metadata=outbound_metadata)
 
     async def send(
@@ -6377,6 +6341,11 @@ def _standalone_sanitize_error(text) -> str:
     )
 
 
+def _standalone_allowed_bot_users() -> set[str]:
+    raw = os.getenv("DISCORD_ALLOWED_BOT_USERS", "")
+    return {uid for uid in _clean_discord_user_ids(raw) if uid.isdigit()}
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -6385,6 +6354,9 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[list] = None,
     force_document: bool = False,
+    bot_msg_internal: bool = False,
+    recipient_bot_id: Optional[str] = None,
+    reply_to: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Send via Discord REST API without a live gateway adapter.
 
@@ -6412,6 +6384,18 @@ async def _standalone_send(
     if not token:
         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
 
+    allowed_bot_ids = _standalone_allowed_bot_users()
+    mentioned_allowed_bots = _discord_content_mentioned_allowed_bots(message, allowed_bot_ids)
+    if len(mentioned_allowed_bots) > 1:
+        return {"error": "Multiple allowed bot mentions are not permitted in a BOT_MSG v1 envelope"}
+    if mentioned_allowed_bots and not bot_msg_internal:
+        return {"error": bot_msg_required_error(mentioned_allowed_bots[0])}
+    if bot_msg_internal:
+        if len(message) > DiscordAdapter.MAX_MESSAGE_LENGTH:
+            return {"error": "BOT_MSG v1 envelope exceeds Discord message length and will not be chunked"}
+        if not recipient_bot_id or _parse_discord_bot_msg_v1(message, recipient_bot_id) is None:
+            return {"error": f"Internal BOT_MSG v1 envelope addressed to allowed bot {recipient_bot_id} is invalid"}
+
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
@@ -6421,6 +6405,19 @@ async def _standalone_send(
         media_files = media_files or []
         last_data = None
         warnings = []
+
+        def _message_payload(content: str) -> dict:
+            payload = {"content": content}
+            if bot_msg_internal and recipient_bot_id:
+                payload["allowed_mentions"] = {
+                    "parse": [],
+                    "users": [str(recipient_bot_id)],
+                    "roles": [],
+                    "replied_user": False,
+                }
+            if reply_to:
+                payload["message_reference"] = {"message_id": str(reply_to), "fail_if_not_exists": False}
+            return payload
 
         # Thread endpoint: Discord threads are channels; send directly to the thread ID.
         if thread_id:
@@ -6511,7 +6508,7 @@ async def _standalone_send(
                             headers=json_headers,
                             json={
                                 "name": thread_name,
-                                "message": {"content": message},
+                                "message": _message_payload(message),
                             },
                             **_req_kw,
                         ) as resp:
@@ -6538,7 +6535,7 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                async with session.post(url, headers=json_headers, json=_message_payload(message), **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}
@@ -6581,6 +6578,53 @@ async def _standalone_send(
         return result
     except Exception as e:
         return {"error": _standalone_sanitize_error(f"Discord send failed: {e}")}
+
+
+async def _standalone_send_bot_message(
+    pconfig,
+    chat_id: str,
+    *,
+    recipient_bot_id: str,
+    body: str,
+    reply_expected: bool,
+    kind: str,
+    correlation_id: str,
+    thread_id: Optional[str] = None,
+    reply_to: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Send a structured BOT_MSG v1 envelope via Discord REST without a live adapter."""
+    try:
+        envelope = _build_discord_bot_msg_v1(
+            recipient_bot_id=recipient_bot_id,
+            body=body,
+            reply_expected=reply_expected,
+            kind=kind,
+            correlation_id=correlation_id,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if len(envelope) > DiscordAdapter.MAX_MESSAGE_LENGTH:
+        return {"error": "BOT_MSG v1 envelope exceeds Discord message length and will not be chunked"}
+    result = await _standalone_send(
+        pconfig,
+        chat_id,
+        envelope,
+        thread_id=thread_id,
+        bot_msg_internal=True,
+        recipient_bot_id=recipient_bot_id,
+        reply_to=reply_to,
+    )
+    if result.get("success"):
+        result.update(
+            {
+                "bot_msg_v1": True,
+                "recipient_bot_id": str(recipient_bot_id),
+                "kind": kind,
+                "reply_expected": bool(reply_expected),
+                "correlation_id": correlation_id,
+            }
+        )
+    return result
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────
