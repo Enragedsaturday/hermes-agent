@@ -751,7 +751,10 @@ DEFAULT_CONFIG = {
     "web": {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
-        "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
+        # Local-first default: render with agent-browser and fall back to
+        # static HTML extraction. Paid scraper APIs (Firecrawl/Parallel/etc.)
+        # should be explicit escalation, not the ordinary extraction path.
+        "extract_backend": "local-browser",
     },
 
     "browser": {
@@ -759,6 +762,9 @@ DEFAULT_CONFIG = {
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
         "allow_private_urls": False,  # Allow navigating to private/internal IPs (localhost, 192.168.x.x, etc.)
+        # Local-first browser automation. Cloud providers should be explicit
+        # escalation because they send page state off-machine and can incur cost.
+        "cloud_provider": "local",
         # Browser engine for local mode.  Passed as ``--engine <value>`` to
         # agent-browser v0.25.3+.
         # "auto"       — use Chrome (default, don't pass --engine at all)

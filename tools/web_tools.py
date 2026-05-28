@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import asyncio
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
@@ -140,7 +141,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
+    if configured in {"local-browser", "parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai"}:
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -204,6 +205,8 @@ def _get_capability_backend(capability: str) -> str:
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
+    if backend == "local-browser":
+        return shutil.which("agent-browser") is not None
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":
@@ -1367,7 +1370,7 @@ async def web_crawl_tool(
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"}:
+    if configured in {"local-browser", "exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)
