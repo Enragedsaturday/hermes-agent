@@ -66,8 +66,8 @@ async def test_send_exec_approval_mentions_supervisor_and_includes_text_command_
     channel.send.assert_awaited_once()
     content = channel.send.await_args.kwargs["content"]
     assert content.startswith("<@111111111111111111> approval required")
-    assert "<@222222222222222222> /approve" in content
-    assert "<@222222222222222222> /deny" in content
+    assert "approval_decision BOT_MSG" in content
+    assert "`/approve` / `/deny`" in content
     assert channel.send.await_args.kwargs["embed"] is not None
     assert channel.send.await_args.kwargs["view"] is not None
 
@@ -99,7 +99,9 @@ async def test_send_exec_approval_uses_bot_msg_for_allowed_supervisor_bot(monkey
     assert parsed["kind"] == "approval_request"
     assert parsed["correlation_id"].startswith("approval:")
     assert "approval required" in parsed["body"]
-    assert "/approve" in parsed["body"]
+    assert "approval_id:" in parsed["body"]
+    assert "send_bot_approval_decision" in parsed["body"]
+    assert "/approve" not in parsed["body"]
 
 
 @pytest.mark.asyncio
@@ -123,6 +125,7 @@ async def test_send_exec_approval_keeps_content_optional_without_notify(monkeypa
     assert result.success is True
     content = channel.send.await_args.kwargs["content"]
     assert content == (
-        "Galt/another supervisor bot can approve by replying in this same thread/session "
-        "with `<@222222222222222222> /approve` or deny with `<@222222222222222222> /deny`."
+        "Galt/another supervisor bot can approve only by sending a structured "
+        "approval_decision BOT_MSG for this live request. Human operators can use "
+        "the buttons below or reply `/approve` / `/deny`."
     )

@@ -170,6 +170,7 @@ SEND_BOT_MESSAGE_SCHEMA = {
                 "enum": [
                     "status",
                     "action_required",
+                    "approval_decision",
                     "approval_request",
                     "decision_request",
                     "handoff",
@@ -203,6 +204,28 @@ SEND_BOT_MESSAGE_SCHEMA = {
     },
 }
 
+SEND_BOT_APPROVAL_DECISION_SCHEMA = {
+    "name": "send_bot_approval_decision",
+    "description": (
+        "Resolve a live Discord bot-to-bot dangerous-command approval request. "
+        "Use only when an approval_request BOT_MSG provides an approval_id. "
+        "Sends an approval_decision BOT_MSG with reply_expected=false; never raw-mention /approve or /deny."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "description": "Discord delivery target: discord:chat_id or discord:chat_id:thread_id."},
+            "recipient_bot_id": {"type": "string", "description": "Numeric Discord user ID of the bot that owns the pending approval."},
+            "approval_id": {"type": "string", "description": "Opaque live approval_id copied from the approval_request BOT_MSG."},
+            "decision": {"type": "string", "enum": ["approve", "deny"]},
+            "scope": {"type": "string", "enum": ["once", "session", "always"], "description": "Approval persistence for approve decisions. Defaults to once."},
+            "correlation_id": {"type": "string", "description": "Optional correlation id. Defaults to approval:<approval_id>."},
+            "reply_to": {"type": "string", "description": "Optional Discord message id to reply to."},
+        },
+        "required": ["target", "recipient_bot_id", "approval_id", "decision"],
+    },
+}
+
 
 
 def send_message_tool(args, **kw):
@@ -227,6 +250,11 @@ def _handle_list():
 def send_bot_message_tool(args, **kw):
     """Handle structured Discord bot-to-bot send calls."""
     return _handle_send_bot_message(args)
+
+
+def send_bot_approval_decision_tool(args, **kw):
+    """Handle structured Discord bot-to-bot approval decisions."""
+    return _handle_send_bot_approval_decision(args)
 
 
 def _discord_allowed_bot_user_ids_from_env() -> set[str]:
@@ -295,6 +323,39 @@ def _write_bot_idempotency_store(store: dict) -> None:
     import json
     from utils import atomic_json_write
     atomic_json_write(_bot_idempotency_store_path(), store)
+
+
+def _handle_send_bot_approval_decision(args):
+    target = (args.get("target") or "").strip()
+    recipient_bot_id = str(args.get("recipient_bot_id") or "").strip()
+    approval_id = (args.get("approval_id") or "").strip()
+    decision = (args.get("decision") or "").strip().lower()
+    scope = (args.get("scope") or "once").strip().lower()
+    correlation_id = (args.get("correlation_id") or "").strip() or f"approval:{approval_id}"
+    reply_to = (args.get("reply_to") or "").strip()
+
+    if not approval_id:
+        return tool_error("approval_id is required")
+    if decision not in {"approve", "deny"}:
+        return tool_error("decision must be approve or deny")
+    if scope not in {"once", "session", "always"}:
+        return tool_error("scope must be once, session, or always")
+    body = "\n".join([
+        f"approval_id: {approval_id}",
+        f"decision: {decision}",
+        f"scope: {scope}",
+    ])
+    payload = {
+        "target": target,
+        "recipient_bot_id": recipient_bot_id,
+        "kind": "approval_decision",
+        "reply_expected": False,
+        "body": body,
+        "correlation_id": correlation_id,
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
+    return _handle_send_bot_message(payload)
 
 
 def _handle_send_bot_message(args):
@@ -2119,4 +2180,13 @@ registry.register(
     handler=send_bot_message_tool,
     check_fn=_check_send_message,
     emoji="🤖",
+)
+
+registry.register(
+    name="send_bot_approval_decision",
+    toolset="messaging",
+    schema=SEND_BOT_APPROVAL_DECISION_SCHEMA,
+    handler=send_bot_approval_decision_tool,
+    check_fn=_check_send_message,
+    emoji="✅",
 )

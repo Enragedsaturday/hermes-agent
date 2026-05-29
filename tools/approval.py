@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -572,6 +573,38 @@ def resolve_gateway_approval(session_key: str, choice: str,
         entry.result = choice
         entry.event.set()
     return len(targets)
+
+
+def resolve_gateway_approval_by_id(approval_id: str, choice: str) -> int:
+    """Resolve exactly one live gateway approval by opaque request id.
+
+    Structured bot-to-bot approval decisions use this instead of session-key
+    FIFO resolution so a supervisor bot cannot accidentally approve a different
+    pending command in the same thread/session.  Resolved entries are removed;
+    replaying the same approval_id therefore returns 0 and has no effect.
+    """
+    approval_id = (approval_id or "").strip()
+    if not approval_id:
+        return 0
+    with _lock:
+        for session_key, queue in list(_gateway_queues.items()):
+            for entry in list(queue):
+                if str((entry.data or {}).get("approval_id") or "") != approval_id:
+                    continue
+                queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+                target = entry
+                break
+            else:
+                continue
+            break
+        else:
+            return 0
+
+    target.result = choice
+    target.event.set()
+    return 1
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -1381,7 +1414,9 @@ def check_all_command_guards(command: str, env_type: str,
             # --- Blocking gateway approval (queue-based) ---
             # Each call gets its own _ApprovalEntry so parallel subagents
             # and execute_code threads can block concurrently.
+            approval_id = "gw-" + uuid.uuid4().hex
             approval_data = {
+                "approval_id": approval_id,
                 "command": command,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,

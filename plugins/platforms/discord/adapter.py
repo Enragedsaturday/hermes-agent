@@ -85,7 +85,9 @@ from .bot_msg_protocol import (
     discord_content_mentions_allowed_bot,
     discord_mention_id,
     is_bot_msg_required_error,
+    is_discord_bot_routing_guard_error,
     parse_discord_bot_msg_v1,
+    parse_discord_bot_approval_decision_body,
 )
 
 
@@ -837,8 +839,8 @@ class DiscordAdapter(BasePlatformAdapter):
         return True
 
     def _is_terminal_send_error(self, error: Optional[str]) -> bool:
-        """Raw allowlisted-bot mentions must not retry or plain-text fallback."""
-        return is_bot_msg_required_error(error)
+        """Bot-routing guard failures must not retry or plain-text fallback."""
+        return is_bot_msg_required_error(error) or is_discord_bot_routing_guard_error(error)
 
     def _should_react_malformed_bot_message(self, message: Any) -> bool:
         """Return True only for explicit bot-targeted messages with malformed BOT_MSG v1.
@@ -854,6 +856,62 @@ class DiscordAdapter(BasePlatformAdapter):
             and self._is_allowed_bot_user(message.author.id)
             and _parse_discord_bot_msg_v1(message.content, self._client.user.id) is None
         )
+
+    async def _handle_bot_approval_decision(self, message: Any, bot_msg: Dict[str, Any]) -> bool:
+        """Resolve a live gateway approval from a structured BOT_MSG decision.
+
+        Returns True when the message was syntactically an approval decision and
+        was handled without dispatching a model turn.  The sender has already
+        passed the allowlisted-bot gate before this method is called.
+        """
+        if bot_msg.get("kind") != "approval_decision":
+            return False
+        parsed = parse_discord_bot_approval_decision_body(bot_msg.get("body") or "")
+        if parsed is None:
+            logger.warning(
+                "[%s] Rejecting malformed approval_decision BOT_MSG from %s",
+                self.name,
+                getattr(getattr(message, "author", None), "id", "unknown"),
+            )
+            try:
+                await asyncio.wait_for(self._add_reaction(message, "❌"), timeout=3.0)
+            except Exception:
+                pass
+            return True
+
+        decision = parsed["decision"]
+        if decision == "deny":
+            choice = "deny"
+        else:
+            choice = parsed["scope"]
+        try:
+            from tools.approval import resolve_gateway_approval_by_id
+            count = resolve_gateway_approval_by_id(parsed["approval_id"], choice)
+        except Exception as exc:
+            logger.warning("[%s] Failed resolving approval_decision: %s", self.name, exc)
+            count = 0
+        if count:
+            logger.info(
+                "[%s] Resolved gateway approval %s via BOT_MSG approval_decision from %s (%s)",
+                self.name,
+                parsed["approval_id"],
+                getattr(getattr(message, "author", None), "id", "unknown"),
+                choice,
+            )
+            reaction = "✅" if decision == "approve" else "🚫"
+        else:
+            logger.warning(
+                "[%s] Rejected approval_decision for non-live approval_id %s from %s",
+                self.name,
+                parsed["approval_id"],
+                getattr(getattr(message, "author", None), "id", "unknown"),
+            )
+            reaction = "❌"
+        try:
+            await asyncio.wait_for(self._add_reaction(message, reaction), timeout=3.0)
+        except Exception:
+            pass
+        return True
 
     def _should_accept_bot_message(self, message: Any, allow_bots: str) -> bool:
         if allow_bots == "none":
@@ -1095,6 +1153,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     if allow_bots == "mentions" and adapter_self._client and adapter_self._client.user:
                         _bot_msg = _parse_discord_bot_msg_v1(message.content, adapter_self._client.user.id)
                         if _bot_msg is None:
+                            return
+                        if await adapter_self._handle_bot_approval_decision(message, _bot_msg):
                             return
                         if not _bot_msg["reply_expected"]:
                             ack_reaction = _discord_bot_reply_false_reaction()
@@ -4600,6 +4660,14 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             embed.add_field(name="Reason", value=description, inline=False)
 
+            approval_id = ""
+            if metadata:
+                approval_id = str(metadata.get("approval_id") or "").strip()
+            if not approval_id:
+                approval_id = "approval-" + hashlib.sha256(
+                    f"{session_key}\0{command}".encode("utf-8")
+                ).hexdigest()[:24]
+
             self_mention = ""
             try:
                 if self._client and self._client.user:
@@ -4621,19 +4689,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     None,
                 )
                 if recipient_bot_id:
-                    body_lines = ["approval required"]
-                    if self_mention:
-                        body_lines.append(
-                            f"Galt/another supervisor bot can approve by replying in this same thread/session with `{self_mention} /approve` "
-                            f"or deny with `{self_mention} /deny`."
-                        )
+                    body_lines = [
+                        "approval required",
+                        f"approval_id: {approval_id}",
+                        "Use send_bot_approval_decision with this approval_id to approve or deny this live request.",
+                        "Do not answer with legacy slash-command approval text.",
+                    ]
                     content_lines.append(
                         _build_discord_bot_msg_v1(
                             recipient_bot_id=recipient_bot_id,
                             body="\n".join(body_lines),
                             reply_expected=True,
                             kind="approval_request",
-                            correlation_id=f"approval:{hashlib.sha256(session_key.encode('utf-8')).hexdigest()[:32]}",
+                            correlation_id=f"approval:{approval_id}",
                         )
                     )
                     used_bot_msg_envelope = True
@@ -4641,8 +4709,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     content_lines.append(" ".join(notify_mentions) + " approval required")
             if self_mention and not used_bot_msg_envelope:
                 content_lines.append(
-                    f"Galt/another supervisor bot can approve by replying in this same thread/session with `{self_mention} /approve` "
-                    f"or deny with `{self_mention} /deny`."
+                    "Galt/another supervisor bot can approve only by sending a structured "
+                    "approval_decision BOT_MSG for this live request. Human operators can use "
+                    "the buttons below or reply `/approve` / `/deny`."
                 )
             content = "\n".join(content_lines) or None
 

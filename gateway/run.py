@@ -17031,6 +17031,10 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                approval_id = str(approval_data.get("approval_id") or "").strip()
+                approval_metadata = dict(_status_thread_metadata or {})
+                if approval_id:
+                    approval_metadata["approval_id"] = approval_id
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -17043,7 +17047,7 @@ class GatewayRunner:
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=approval_metadata,
                             ),
                             _loop_for_step,
                             logger=logger,

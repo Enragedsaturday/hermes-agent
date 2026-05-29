@@ -6,7 +6,9 @@ and implement the required methods.
 """
 
 import asyncio
+import hashlib
 import inspect
+import json
 import ipaddress
 import logging
 import os
@@ -1454,6 +1456,15 @@ _RETRYABLE_ERROR_PATTERNS = (
     "eoferror",
 )
 
+_BOT_ROUTING_OPERATIONAL_RE = re.compile(
+    r"(?im)^(?:\s*(?:BOT_MSG\s+v1|ACTION_REQUIRED|DECISION_REQUEST|APPROVAL_REQUEST|HANDOFF|REVIEW_REQUEST)\b"
+    r"|.*\b(?:action_required|decision_request|approval_request|approval_id|correlation_id|reply_expected)\s*:)",
+)
+_BOT_ROUTING_TARGET_RE = re.compile(
+    r"(?i)\b(?:galt/default|default\s+profile|statute\s+pm|statutes?\s+pm|nj-statutes-pm|pm\s+worker|worker\s+bot)\b"
+)
+_BOT_ROUTING_TOOL_RE = re.compile(r"(?i)\bsend_bot_(?:message|approval_decision)\s*\(")
+
 
 # Type for message handlers.  Handlers may return a plain string (normal
 # reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
@@ -2830,6 +2841,127 @@ class BasePlatformAdapter(ABC):
             return response.text, int(ttl or 0)
         return response, 0
 
+    def _should_guard_discord_bot_final_response(self, event: MessageEvent, text_content: str) -> tuple[bool, list[str]]:
+        """Return whether a Discord final response is an unsafe bot-routing payload.
+
+        This is a last-line guard for model free-form final responses. Operative
+        bot-to-bot traffic must use send_bot_message/send_bot_approval_decision,
+        not ordinary channel prose. The guard is intentionally narrow: it only
+        fires in Discord contexts that are bot-originated or explicitly name bot
+        routing targets, and where the response looks operational rather than
+        explanatory.
+        """
+        if _platform_name(getattr(self, "platform", None)) != "discord":
+            return False, []
+        text = text_content or ""
+        if not text.strip():
+            return False, []
+        source = getattr(event, "source", None)
+        if source is None:
+            return False, []
+        if _BOT_ROUTING_TOOL_RE.search(text):
+            return False, []
+        reasons: list[str] = []
+        if bool(getattr(source, "is_bot", False)):
+            reasons.append("source_is_bot")
+        allowed = {p.strip() for p in (os.getenv("DISCORD_ALLOWED_BOT_USERS", "") or "").replace(",", " ").split() if p.strip()}
+        sender_id = str(getattr(source, "user_id", "") or "")
+        if sender_id and sender_id in allowed:
+            reasons.append("source_user_is_allowlisted_bot")
+        target_text = "\n".join(
+            str(v or "")
+            for v in (
+                getattr(source, "chat_name", None),
+                getattr(source, "chat_topic", None),
+                getattr(source, "chat_id", None),
+                getattr(source, "thread_id", None),
+                text,
+            )
+        )
+        if _BOT_ROUTING_TARGET_RE.search(target_text):
+            reasons.append("bot_target_indicator")
+        if not reasons:
+            return False, []
+        if _BOT_ROUTING_OPERATIONAL_RE.search(text):
+            reasons.append("operational_payload_indicator")
+            return True, reasons
+        return False, []
+
+    def _write_discord_bot_routing_guard_audit(
+        self,
+        *,
+        event: MessageEvent,
+        text_content: str,
+        reasons: list[str],
+    ) -> Path:
+        source = getattr(event, "source", None)
+        now = datetime.utcnow()
+        digest = hashlib.sha256((text_content or "").encode("utf-8")).hexdigest()
+        audit_dir = get_hermes_home() / "logs" / "routing_guard"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        path = audit_dir / f"{now.strftime('%Y%m%dT%H%M%S%fZ')}-{digest[:12]}.json"
+        payload = {
+            "event": "bot_routing_final_response_guard",
+            "created_at": now.isoformat(timespec="microseconds") + "Z",
+            "platform": _platform_name(getattr(self, "platform", None)),
+            "adapter": self.name,
+            "reasons": reasons,
+            "body_sha256": digest,
+            "body_len": len(text_content or ""),
+            "body": text_content or "",
+            "source": {
+                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                "thread_id": str(getattr(source, "thread_id", "") or ""),
+                "chat_name": str(getattr(source, "chat_name", "") or ""),
+                "chat_type": str(getattr(source, "chat_type", "") or ""),
+                "user_id": str(getattr(source, "user_id", "") or ""),
+                "user_name": str(getattr(source, "user_name", "") or ""),
+                "is_bot": bool(getattr(source, "is_bot", False)),
+                "message_id": str(getattr(event, "message_id", "") or ""),
+            },
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return path
+
+    async def _send_text_response_with_routing_guard(
+        self,
+        *,
+        event: MessageEvent,
+        text_content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+    ) -> "SendResult":
+        blocked, reasons = self._should_guard_discord_bot_final_response(event, text_content)
+        if not blocked:
+            return await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=text_content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        audit_path = self._write_discord_bot_routing_guard_audit(
+            event=event,
+            text_content=text_content,
+            reasons=reasons,
+        )
+        logger.error(
+            "[%s] BOT_ROUTING_GUARD blocked ordinary Discord bot-to-bot final response; audit=%s reasons=%s",
+            self.name,
+            audit_path,
+            ",".join(reasons),
+        )
+        notice = (
+            "[ROUTING_GUARD] A bot-to-bot operational message was blocked because it was produced as an "
+            "ordinary final response instead of through send_bot_message/send_bot_approval_decision. "
+            f"Audit: {audit_path} body_sha256={hashlib.sha256((text_content or '').encode('utf-8')).hexdigest()}."
+        )
+        return await self._send_with_retry(
+            chat_id=event.source.chat_id,
+            content=notice,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -3727,9 +3859,9 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
-                    result = await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
+                    result = await self._send_text_response_with_routing_guard(
+                        event=event,
+                        text_content=text_content,
                         reply_to=_reply_anchor,
                         metadata=_thread_metadata,
                     )

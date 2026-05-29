@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 DISCORD_BOT_MSG_KINDS = {
     "status",
     "action_required",
+    "approval_decision",
     "approval_request",
     "decision_request",
     "handoff",
@@ -25,6 +26,7 @@ DISCORD_MENTION_RE = re.compile(r"<@!?(\d+)>")
 DISCORD_BOT_MSG_REQUIRED_ERROR_RE = re.compile(
     r"Outbound raw mention of allowed bot \d+ requires send_bot_message\(\.\.\.\)"
 )
+DISCORD_BOT_ROUTING_GUARD_ERROR_RE = re.compile(r"BOT_ROUTING_GUARD:")
 DISCORD_BOT_MSG_DEFAULT_MAX_BODY_CHARS = 1800
 
 
@@ -137,6 +139,35 @@ def parse_discord_bot_msg_v1(content: str, recipient_bot_id: Any) -> Optional[Di
     }
 
 
+def parse_discord_bot_approval_decision_body(body: str) -> Optional[Dict[str, str]]:
+    """Parse the narrow approval_decision BOT_MSG body grammar.
+
+    Body format is line-oriented and deliberately not free-form:
+      approval_id: <opaque live request id>
+      decision: approve|deny
+      scope: once|session|always        # optional for deny; defaults once
+    """
+    values: Dict[str, str] = {}
+    for raw_line in (body or "").splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        if key in {"approval_id", "decision", "scope"}:
+            values[key] = value.strip().lower() if key != "approval_id" else value.strip()
+    approval_id = values.get("approval_id", "")
+    decision = values.get("decision", "")
+    scope = values.get("scope", "once") or "once"
+    if not approval_id:
+        return None
+    if decision not in {"approve", "deny"}:
+        return None
+    if scope not in {"once", "session", "always"}:
+        return None
+    return {"approval_id": approval_id, "decision": decision, "scope": scope}
+
+
 def discord_content_mentioned_allowed_bots(content: str, allowed_bot_ids: set[str]) -> list[str]:
     """Return allowed bot IDs raw-mentioned in content, in content order."""
     if not content or not allowed_bot_ids:
@@ -158,6 +189,15 @@ def is_bot_msg_required_error(error: Any) -> bool:
     """Return True for terminal raw-allowed-bot-mention guard failures."""
     text = str(error or "")
     return bool(DISCORD_BOT_MSG_REQUIRED_ERROR_RE.search(text))
+
+
+def is_discord_bot_routing_guard_error(error: Any) -> bool:
+    """Return True for terminal Discord bot-routing final-response guard failures."""
+    return bool(DISCORD_BOT_ROUTING_GUARD_ERROR_RE.search(str(error or "")))
+
+
+def discord_bot_routing_guard_error() -> str:
+    return "BOT_ROUTING_GUARD: blocked ordinary bot-to-bot final response"
 
 
 def bot_msg_required_error(bot_id: str) -> str:
