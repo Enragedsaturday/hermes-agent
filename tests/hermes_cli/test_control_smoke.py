@@ -74,7 +74,7 @@ def test_readiness_live_check_reports_lease_health_from_isolated_home(tmp_path, 
     assert result["runtime_profiles"]["nj-statutes-pm"] == "present"
 
 
-def test_readiness_live_check_treats_expired_bootstrap_leases_as_diagnostic(tmp_path, monkeypatch):
+def test_readiness_live_check_treats_missing_live_admin_as_not_ready(tmp_path, monkeypatch):
     root = tmp_path / ".hermes"
     conn = cp.connect(root=root)
     try:
@@ -88,10 +88,30 @@ def test_readiness_live_check_treats_expired_bootstrap_leases_as_diagnostic(tmp_
     monkeypatch.setattr("hermes_cli.control.worker_spawnability_status", lambda *_args, **_kwargs: {"status": "dry_run_ok", "command": [], "returncode": 0, "stderr": ""})
     monkeypatch.setattr("hermes_cli.control.help_parse_status", lambda *_args, **_kwargs: {"ok": True, "returncode": 0, "stderr": "", "command": []})
     result = _readiness(type("Args", (), {"live_check": True})(), resolve_control_target(live=True))
-    assert result["live_ready"] is True
+    assert result["live_ready"] is False
+    assert result["live_admin_available"] is False
     assert result["seeded_instance_leases"]["default:bootstrap"]["live"] is False
     assert "bootstrap_command" not in result
-    assert not any("bootstrap lease not live" in reason for reason in result["reasons"])
+    assert "no live admin control-plane instance" in result["reasons"]
+
+
+def test_readiness_live_check_does_not_count_null_admin_lease(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    conn = cp.connect(root=root)
+    try:
+        cp.bootstrap_statutepm_policies(conn, seed_instances=True)
+        conn.execute("UPDATE cp_profile_instances SET lease_expires_at_ms=NULL WHERE instance_id='default:bootstrap'")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"default", "nj-statutes-pm", "statute-worker"})
+    monkeypatch.setattr("hermes_cli.control.worker_spawnability_status", lambda *_args, **_kwargs: {"status": "dry_run_ok", "command": [], "returncode": 0, "stderr": ""})
+    monkeypatch.setattr("hermes_cli.control.help_parse_status", lambda *_args, **_kwargs: {"ok": True, "returncode": 0, "stderr": "", "command": []})
+    result = _readiness(type("Args", (), {"live_check": True})(), resolve_control_target(live=True))
+    assert result["live_admin_available"] is False
+    assert result["live_ready"] is False
+    assert "no live admin control-plane instance" in result["reasons"]
 
 
 def _wave_args(payload, key="wave-1", **overrides):

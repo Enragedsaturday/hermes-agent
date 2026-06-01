@@ -681,6 +681,59 @@ def heartbeat_instance(conn: sqlite3.Connection, instance_id: str, *, lease_ms: 
     return cur.rowcount == 1
 
 
+def renew_admin_bootstrap_instance_lease(
+    conn: sqlite3.Connection,
+    *,
+    profile_id: str,
+    instance_id: str,
+    lease_ms: int = 120_000,
+) -> dict[str, Any]:
+    """Refresh an existing seeded admin bootstrap lease without rewriting history.
+
+    This is deliberately narrower than ``register_instance``. It only revives an
+    existing ``<admin-profile>:bootstrap`` row owned by an admin profile. It does
+    not create profiles, create new admin instances, or authorize PM/worker
+    bootstrap actors.
+    """
+    if lease_ms <= 0 or lease_ms > 120_000:
+        raise ValueError("admin bootstrap lease_ms must be between 1 and 120000")
+    if instance_id != f"{profile_id}:bootstrap":
+        raise PermissionError("admin lease renewal is limited to the profile bootstrap instance")
+    ts = now_ms()
+    lease_expires_at_ms = ts + lease_ms
+    with transaction(conn):
+        row = conn.execute(
+            "SELECT i.instance_id, i.profile_id, i.status, i.lease_expires_at_ms, i.metadata_json, p.role "
+            "FROM cp_profile_instances i JOIN cp_profiles p ON p.profile_id=i.profile_id "
+            "WHERE i.instance_id=? AND i.profile_id=?",
+            (instance_id, profile_id),
+        ).fetchone()
+        if row is None:
+            raise PermissionError(f"unknown admin bootstrap instance: {instance_id}")
+        if row["role"] != "admin":
+            raise PermissionError("admin lease renewal requires an admin profile")
+        if row["status"] != "online":
+            raise PermissionError("admin lease renewal refuses offline admin bootstrap instances")
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        if not bool(metadata.get("seeded_by_bootstrap")):
+            raise PermissionError("admin lease renewal requires a seeded bootstrap instance")
+        conn.execute(
+            "UPDATE cp_profile_instances SET heartbeat_at_ms=?, lease_expires_at_ms=?, status='online' WHERE instance_id=?",
+            (ts, lease_expires_at_ms, instance_id),
+        )
+    return {
+        "instance_id": instance_id,
+        "profile_id": profile_id,
+        "heartbeat_at_ms": ts,
+        "previous_lease_expires_at_ms": int(row["lease_expires_at_ms"]) if row["lease_expires_at_ms"] is not None else None,
+        "lease_expires_at_ms": lease_expires_at_ms,
+        "status": "online",
+    }
+
+
 def mark_instance_offline(conn: sqlite3.Connection, instance_id: str, *, now_ms_value: int | None = None) -> bool:
     """Mark a finite-lived profile instance offline without deleting audit state."""
     ts = _ts(now_ms_value)

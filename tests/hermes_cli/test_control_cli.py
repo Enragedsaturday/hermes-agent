@@ -134,6 +134,87 @@ def test_message_transition_requires_live_flag_for_live_root(tmp_path):
     assert "refusing to mutate live control DB without --live" in result.stderr
 
 
+def test_live_message_admin_transition_renews_expired_bootstrap_admin_once(tmp_path):
+    env = _profile_env(tmp_path)
+    home = Path(env["HERMES_HOME"])
+    run_cli("bootstrap-statutepm", "--live", "--seed-instances", env=env)
+    msg = json.loads(
+        run_cli(
+            "message",
+            "create",
+            "--live",
+            "--sender-instance-id",
+            "statutepm:bootstrap",
+            "--receiver",
+            "default",
+            "--kind",
+            "action_required",
+            "--body",
+            "stale administrative action",
+            env=env,
+        ).stdout
+    )
+    conn = cp.connect(root=home)
+    try:
+        conn.execute(
+            "UPDATE cp_profile_instances SET heartbeat_at_ms=0, lease_expires_at_ms=1 WHERE instance_id='default:bootstrap'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = json.loads(
+        run_cli(
+            "message",
+            "resolve",
+            msg["message_id"],
+            "--live",
+            "--actor-type",
+            "admin",
+            "--actor-profile",
+            "default",
+            "--actor-instance-id",
+            "default:bootstrap",
+            "--reason",
+            "stale and superseded",
+            env=env,
+        ).stdout
+    )
+
+    assert result["status"] == "resolved"
+    assert result["changed"] is True
+    assert result["admin_lease_renewed"] is True
+
+
+def test_admin_lease_command_renews_existing_live_bootstrap_admin(tmp_path):
+    env = _profile_env(tmp_path)
+    home = Path(env["HERMES_HOME"])
+    run_cli("bootstrap-statutepm", "--live", "--seed-instances", env=env)
+    conn = cp.connect(root=home)
+    try:
+        conn.execute("UPDATE cp_profile_instances SET heartbeat_at_ms=0, lease_expires_at_ms=1 WHERE instance_id='default:bootstrap'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = json.loads(
+        run_cli(
+            "admin",
+            "lease",
+            "--live",
+            "--profile",
+            "default",
+            "--instance-id",
+            "default:bootstrap",
+            env=env,
+        ).stdout
+    )
+
+    assert result["instance_id"] == "default:bootstrap"
+    assert result["status"] == "online"
+    assert result["lease_expires_at_ms"] > result["heartbeat_at_ms"]
+
+
 def test_new_control_help_surfaces_parse():
     assert run_cli("pm", "run", "--help").returncode == 0
     assert run_cli("live-smoke", "--help").returncode == 0

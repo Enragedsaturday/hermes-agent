@@ -29,6 +29,7 @@ MUTATING = {
     "bootstrap",
     "profile",
     "heartbeat",
+    "admin:lease",
     "bootstrap-statutepm",
     "route:add",
     "route:remove",
@@ -76,6 +77,65 @@ def _json_arg(value: str | None, default: Any) -> Any:
     if not value:
         return default
     return json.loads(value)
+
+
+def _transition_message_status_with_admin_lease_retry(conn, args, target, *, status: str) -> dict[str, Any]:
+    metadata = _json_arg(args.metadata_json, {})
+    try:
+        result = cp.transition_message_status(
+            conn,
+            args.message_id,
+            status=status,
+            actor_instance_id=args.actor_instance_id,
+            actor_profile=args.actor_profile,
+            actor_type=args.actor_type,
+            reason=args.reason,
+            metadata=metadata,
+        )
+        result["admin_lease_renewed"] = False
+        return result
+    except PermissionError as exc:
+        if not (
+            target.live
+            and args.actor_type == "admin"
+            and args.actor_profile
+            and args.actor_instance_id
+            and "admin actor instance is not live/authorized" in str(exc)
+        ):
+            raise
+        try:
+            lease_info = cp.renew_admin_bootstrap_instance_lease(
+                conn,
+                profile_id=args.actor_profile,
+                instance_id=args.actor_instance_id,
+            )
+        except (PermissionError, ValueError) as renew_exc:
+            raise SystemExit(f"ACTION_REQUIRED_NO_LIVE_ADMIN: {renew_exc}") from renew_exc
+        metadata = {
+            **metadata,
+            "admin_lease_renewed": True,
+            "admin_lease_renewal": {
+                "instance_id": lease_info["instance_id"],
+                "previous_lease_expires_at_ms": lease_info.get("previous_lease_expires_at_ms"),
+                "lease_expires_at_ms": lease_info["lease_expires_at_ms"],
+                "source": "message_transition_retry",
+            },
+        }
+        try:
+            result = cp.transition_message_status(
+                conn,
+                args.message_id,
+                status=status,
+                actor_instance_id=args.actor_instance_id,
+                actor_profile=args.actor_profile,
+                actor_type=args.actor_type,
+                reason=args.reason,
+                metadata=metadata,
+            )
+        except PermissionError as retry_exc:
+            raise SystemExit(f"ACTION_REQUIRED_NO_LIVE_ADMIN: {retry_exc}") from retry_exc
+        result["admin_lease_renewed"] = True
+        return result
 
 
 def _dispatch_row(row) -> dict[str, Any]:
@@ -151,6 +211,19 @@ def cmd_control(args) -> None:
             else:
                 inst = cp.register_instance(conn, args.profile_id, instance_id=args.instance_id, actor_type="worker")
             _print_json({"db_path": str(target.db_path), "instance_id": inst})
+            return
+        if command == "admin" and sub == "lease":
+            try:
+                result = cp.renew_admin_bootstrap_instance_lease(
+                    conn,
+                    profile_id=args.profile,
+                    instance_id=args.instance_id,
+                    lease_ms=args.lease_ms,
+                )
+            except (PermissionError, ValueError) as exc:
+                raise SystemExit(f"ACTION_REQUIRED_NO_LIVE_ADMIN: {exc}") from exc
+            result["db_path"] = str(target.db_path)
+            _print_json(result)
             return
         if command == "instances":
             where = "" if args.include_stale else "WHERE status='online' AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms > ?)"
@@ -300,16 +373,7 @@ def cmd_control(args) -> None:
                 return
             if sub in {"ack", "resolve", "supersede", "cancel"}:
                 status = {"ack": "acknowledged", "resolve": "resolved", "supersede": "superseded", "cancel": "cancelled"}[sub]
-                result = cp.transition_message_status(
-                    conn,
-                    args.message_id,
-                    status=status,
-                    actor_instance_id=args.actor_instance_id,
-                    actor_profile=args.actor_profile,
-                    actor_type=args.actor_type,
-                    reason=args.reason,
-                    metadata=_json_arg(args.metadata_json, {}),
-                )
+                result = _transition_message_status_with_admin_lease_retry(conn, args, target, status=status)
                 result["db_path"] = str(target.db_path)
                 _print_json(result)
                 return
@@ -809,6 +873,21 @@ def _readiness(args, target) -> dict[str, Any]:
                     "lease_expires_in_ms": (int(row["lease_expires_at_ms"]) - now) if row and row["lease_expires_at_ms"] is not None else None,
                     "live": live,
                 }
+            admin_rows = conn.execute(
+                """
+                SELECT i.instance_id, i.profile_id, i.status, i.heartbeat_at_ms, i.lease_expires_at_ms
+                FROM cp_profile_instances i
+                JOIN cp_profiles p ON p.profile_id=i.profile_id
+                WHERE p.role='admin'
+                  AND i.status='online'
+                  AND i.lease_expires_at_ms IS NOT NULL
+                  AND i.lease_expires_at_ms > ?
+                ORDER BY i.profile_id, i.instance_id
+                """,
+                (now,),
+            ).fetchall()
+            checks["live_admin_instances"] = [dict(r) for r in admin_rows]
+            checks["live_admin_available"] = bool(admin_rows)
             checks["routes"] = {
                 "default_to_pm": cp.route_allowed(conn, sender_profile="default", receiver_profile="statutepm", kind="dispatch", capability="dispatch"),
                 "pm_to_worker": cp.route_allowed(conn, sender_profile="statutepm", receiver_profile="statute-worker", kind="dispatch", capability="dispatch"),
@@ -824,9 +903,12 @@ def _readiness(args, target) -> dict[str, Any]:
         for route_name, ok in checks["routes"].items():
             if not ok:
                 reasons.append(f"route missing/denied: {route_name}")
+        if not checks.get("live_admin_available"):
+            reasons.append("no live admin control-plane instance")
         checks["bootstrap_lease_note"] = "seeded bootstrap instances are diagnostic only; finite wave dispatch owns operative supervisor/PM leases"
         checks["live_ready"] = (
             checks["authority_mode"] != "legacy"
+            and checks.get("live_admin_available")
             and not missing_profiles
             and all(checks["routes"].values())
             and runtime_profiles.get(pm_runtime) == "present"
@@ -910,6 +992,15 @@ def register_subparser(subparsers) -> None:
     _add_target_flags(heartbeat)
     heartbeat.add_argument("profile_id", nargs="?", default="default")
     heartbeat.add_argument("--instance-id", default=None)
+
+    admin = sp.add_parser("admin", help="Admin control-plane maintenance")
+    _add_target_flags(admin)
+    asp = admin.add_subparsers(dest="admin_command")
+    alease = asp.add_parser("lease", help="Renew an existing seeded admin bootstrap lease")
+    _add_target_flags(alease)
+    alease.add_argument("--profile", default="default")
+    alease.add_argument("--instance-id", required=True)
+    alease.add_argument("--lease-ms", type=int, default=120_000)
 
     route = sp.add_parser("route", help="Manage route policies")
     _add_target_flags(route)

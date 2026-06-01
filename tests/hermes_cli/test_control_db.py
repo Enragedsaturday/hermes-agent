@@ -576,6 +576,49 @@ def test_pm_admin_instances_require_bootstrap_or_live_admin(tmp_path):
         conn.close()
 
 
+def test_renew_admin_bootstrap_instance_lease_reauthorizes_expired_admin(tmp_path, monkeypatch):
+    conn = db(tmp_path)
+    try:
+        monkeypatch.setattr(cp, "now_ms", lambda: 1_000)
+        cp.bootstrap_statutepm_policies(conn, seed_instances=True, instance_lease_ms=10)
+        monkeypatch.setattr(cp, "now_ms", lambda: 2_000)
+        with pytest.raises(PermissionError):
+            cp.set_authority_mode(conn, "control_db", actor_type="admin", actor_profile="default", actor_instance_id="default:bootstrap")
+
+        result = cp.renew_admin_bootstrap_instance_lease(
+            conn,
+            profile_id="default",
+            instance_id="default:bootstrap",
+            lease_ms=60_000,
+        )
+
+        assert result["instance_id"] == "default:bootstrap"
+        assert result["lease_expires_at_ms"] == 62_000
+        cp.set_authority_mode(conn, "control_db", actor_type="admin", actor_profile="default", actor_instance_id="default:bootstrap")
+        assert cp.get_authority_mode(conn) == "control_db"
+    finally:
+        conn.close()
+
+
+def test_renew_admin_bootstrap_instance_lease_refuses_non_admin_or_non_bootstrap(tmp_path):
+    conn = db(tmp_path)
+    try:
+        cp.bootstrap_statutepm_policies(conn, seed_instances=True)
+        with pytest.raises(PermissionError):
+            cp.renew_admin_bootstrap_instance_lease(conn, profile_id="statutepm", instance_id="statutepm:bootstrap")
+        with pytest.raises(PermissionError):
+            cp.renew_admin_bootstrap_instance_lease(conn, profile_id="default", instance_id="default:other")
+        cp.mark_instance_offline(conn, "default:bootstrap")
+        with pytest.raises(PermissionError):
+            cp.renew_admin_bootstrap_instance_lease(conn, profile_id="default", instance_id="default:bootstrap")
+        with pytest.raises(ValueError):
+            cp.renew_admin_bootstrap_instance_lease(conn, profile_id="default", instance_id="default:bootstrap", lease_ms=0)
+        with pytest.raises(ValueError):
+            cp.renew_admin_bootstrap_instance_lease(conn, profile_id="default", instance_id="default:bootstrap", lease_ms=120_001)
+    finally:
+        conn.close()
+
+
 def _create_v2_control_db(path: Path, *, partial_v3_meta: bool = False) -> None:
     path.parent.mkdir(parents=True)
     conn = sqlite3.connect(path)
