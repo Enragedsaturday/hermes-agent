@@ -665,7 +665,7 @@ def register_instance(
             raise ControlPlaneError(f"instance_id {inst!r} already belongs to profile {existing['profile_id']!r}")
         conn.execute(
             "INSERT INTO cp_profile_instances(instance_id,profile_id,pid,host,started_at_ms,heartbeat_at_ms,lease_expires_at_ms,status,metadata_json) "
-            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(instance_id) DO UPDATE SET heartbeat_at_ms=excluded.heartbeat_at_ms, lease_expires_at_ms=excluded.lease_expires_at_ms, status='online', metadata_json=excluded.metadata_json",
+            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(instance_id) DO UPDATE SET pid=excluded.pid, host=excluded.host, heartbeat_at_ms=excluded.heartbeat_at_ms, lease_expires_at_ms=excluded.lease_expires_at_ms, status='online', metadata_json=excluded.metadata_json",
             (inst, profile_id, pid or os.getpid(), host or os.uname().nodename, ts, ts, ts + lease_ms, "online", dumps_redacted(metadata or {})),
         )
     return inst

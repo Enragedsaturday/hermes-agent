@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_cli import control_db as cp
-from hermes_cli.control import _dispatch_statutepm_wave, _readiness, _run_statutepm_live_smoke, _run_statutepm_smoke, _sample_payload
+from hermes_cli.control import _dispatch_statutepm_wave, _readiness, _run_statutepm_live_smoke, _run_statutepm_smoke, _sample_payload, register_subparser
 from hermes_cli.control_runtime import resolve_control_target
-from hermes_cli.control_worker import run_deterministic_dispatch
+from hermes_cli.control_worker import AGENT_WORKER_TERMINATE_GRACE_S, run_deterministic_dispatch
+from hermes_cli.statutepm_flow import PM_CHILD_TIMEOUT_GRACE_S, StatutePMFlow
 
 
 def test_control_smoke_statutepm_isolated_root(tmp_path):
@@ -193,3 +195,34 @@ def test_statutepm_wave_rejects_bootstrap_instances_before_dispatch(tmp_path, mo
         assert conn.execute("SELECT COUNT(*) FROM cp_dispatches").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def _control_parser():
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    register_subparser(subparsers)
+    return parser
+
+
+def test_statutepm_cli_child_timeout_defaults_match_agent_worker_default():
+    parser = _control_parser()
+
+    worker = parser.parse_args(["control", "worker", "run", "disp_child", "--profile-id", "statute-worker", "--instance-id", "statute-worker:test", "--handler", "agent"])
+    pm = parser.parse_args(["control", "pm", "run", "--once"])
+    wave = parser.parse_args(["control", "wave", "dispatch-statutepm", "--payload-json", "{}", "--idempotency-key", "key"])
+
+    assert worker.soft_timeout_s == 600.0
+    assert worker.hard_timeout_s == 3000.0
+    assert worker.timeout_s is None
+    assert pm.child_soft_timeout_s == worker.soft_timeout_s
+    assert pm.child_hard_timeout_s == worker.hard_timeout_s
+    assert wave.child_soft_timeout_s == worker.soft_timeout_s
+    assert wave.child_hard_timeout_s == worker.hard_timeout_s
+
+
+def test_statutepm_parent_deadline_and_lease_include_child_hard_timeout_and_graces(tmp_path):
+    flow = StatutePMFlow(root=tmp_path / ".hermes", pm_instance_id="statutepm:test", poll_interval_s=2.0, child_soft_timeout_s=1.0, child_hard_timeout_s=10.0)
+
+    assert flow._child_deadline_s(now_s=100.0) == 100.0 + 10.0 + AGENT_WORKER_TERMINATE_GRACE_S + PM_CHILD_TIMEOUT_GRACE_S
+    assert flow._parent_lease_ms() > int((10.0 + AGENT_WORKER_TERMINATE_GRACE_S + PM_CHILD_TIMEOUT_GRACE_S) * 1000)
+    assert flow._parent_lease_ms() >= int((10.0 + AGENT_WORKER_TERMINATE_GRACE_S + PM_CHILD_TIMEOUT_GRACE_S + 2.0 + 30.0) * 1000)

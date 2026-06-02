@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +20,11 @@ from hermes_cli.control_contracts import validate_statute_dispatch_v1
 
 CONTROL_RESULT_STATUSES = {"completed", "completed_with_warnings", "failed", "action_required"}
 CONTROL_RESULT_SUCCESS_STATUSES = {"completed", "completed_with_warnings"}
+DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S = 600.0
+DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S = 3000.0
+DEFAULT_AGENT_WORKER_TIMEOUT_S = DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S
+AGENT_WORKER_TERMINATE_GRACE_S = 10.0
+AGENT_RUN_TAIL_CHARS = 4000
 CONTROL_RESULT_STATUS_ALIASES = {
     "blocked": "action_required",
     "blocked_action_required": "action_required",
@@ -207,18 +215,160 @@ def run_deterministic_dispatch(*, root: Path | None, profile_id: str, instance_i
             conn.close()
 
 
-def _default_runner(cmd, *, env: dict[str, str], input_text: str, timeout_s: float, cwd: str | None) -> dict[str, Any]:
-    proc = subprocess.run(
-        cmd,
-        input=input_text,
-        text=True,
-        capture_output=True,
-        env=env,
-        cwd=cwd,
-        timeout=timeout_s,
-        check=False,
-    )
-    return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+def _read_temp_text(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _temp_stat(path: str) -> dict[str, Any]:
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return {"bytes": 0, "mtime_ns": 0}
+    return {"bytes": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+
+
+def _terminate_process_group(proc: subprocess.Popen, *, grace_s: float = AGENT_WORKER_TERMINATE_GRACE_S) -> dict[str, Any]:
+    terminated = False
+    killed = False
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+    if proc.poll() is None:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                proc.terminate()
+            terminated = True
+        except (ProcessLookupError, OSError):
+            pass
+    try:
+        proc.wait(timeout=max(grace_s, 0.0))
+    except subprocess.TimeoutExpired:
+        if proc.poll() is None:
+            try:
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    proc.kill()
+                killed = True
+            except (ProcessLookupError, OSError):
+                pass
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+    return {"terminated": terminated, "killed": killed, "returncode": proc.poll()}
+
+
+def _default_runner(
+    cmd,
+    *,
+    env: dict[str, str],
+    input_text: str,
+    timeout_s: float,
+    cwd: str | None,
+    soft_timeout_s: float = DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S,
+    lease_extender: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    stdout_tmp = tempfile.NamedTemporaryFile(prefix="hermes-agent-stdout-", delete=False)
+    stderr_tmp = tempfile.NamedTemporaryFile(prefix="hermes-agent-stderr-", delete=False)
+    stdout_path = stdout_tmp.name
+    stderr_path = stderr_tmp.name
+    stdout_tmp.close()
+    stderr_tmp.close()
+    soft_checks: list[dict[str, Any]] = []
+    start_s = time.monotonic()
+    hard_deadline_s = start_s + max(float(timeout_s), 0.0)
+    next_soft_s = start_s + max(float(soft_timeout_s), 0.001)
+    last_stdout = _temp_stat(stdout_path)
+    last_stderr = _temp_stat(stderr_path)
+    no_output_checks = 0
+    proc: subprocess.Popen | None = None
+    try:
+        with open(stdout_path, "wb") as stdout_file, open(stderr_path, "wb") as stderr_file:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+                env=env,
+                cwd=cwd,
+                start_new_session=True,
+            )
+            if proc.stdin is not None:
+                proc.stdin.write(input_text)
+                proc.stdin.close()
+            while proc.poll() is None:
+                now_s = time.monotonic()
+                if now_s >= hard_deadline_s:
+                    kill_info = _terminate_process_group(proc)
+                    stdout = _read_temp_text(stdout_path)
+                    stderr = _read_temp_text(stderr_path)
+                    return {
+                        "returncode": None,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "timed_out": True,
+                        "hard_timed_out": True,
+                        "timeout_s": timeout_s,
+                        "hard_timeout_s": timeout_s,
+                        "soft_timeout_s": soft_timeout_s,
+                        "soft_timeout_checks": soft_checks,
+                        "terminated": bool(kill_info["terminated"]),
+                        "killed": bool(kill_info["killed"]),
+                        "post_kill_returncode": kill_info["returncode"],
+                    }
+                if now_s >= next_soft_s:
+                    if lease_extender is not None:
+                        lease_extender()
+                    stdout_stat = _temp_stat(stdout_path)
+                    stderr_stat = _temp_stat(stderr_path)
+                    output_changed = stdout_stat != last_stdout or stderr_stat != last_stderr
+                    no_output_checks = 0 if output_changed else no_output_checks + 1
+                    decision = "extend_progressing" if output_changed else "extend_alive_no_observed_output"
+                    if no_output_checks >= 2:
+                        decision = "soft_stall_suspected"
+                    soft_checks.append(
+                        {
+                            "elapsed_s": round(now_s - start_s, 3),
+                            "alive": True,
+                            "stdout_bytes": stdout_stat["bytes"],
+                            "stderr_bytes": stderr_stat["bytes"],
+                            "stdout_mtime_ns": stdout_stat["mtime_ns"],
+                            "stderr_mtime_ns": stderr_stat["mtime_ns"],
+                            "output_changed": output_changed,
+                            "decision": decision,
+                        }
+                    )
+                    last_stdout = stdout_stat
+                    last_stderr = stderr_stat
+                    next_soft_s += max(float(soft_timeout_s), 0.001)
+                time.sleep(min(0.1, max(0.001, hard_deadline_s - time.monotonic())))
+            return {"returncode": proc.returncode, "stdout": _read_temp_text(stdout_path), "stderr": _read_temp_text(stderr_path), "soft_timeout_checks": soft_checks}
+    finally:
+        if proc is not None and proc.poll() is None:
+            _terminate_process_group(proc)
+        for path in (stdout_path, stderr_path):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def _text_tail(value: Any, *, limit: int = AGENT_RUN_TAIL_CHARS) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        text = bytes(value).decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    return cp.redact_text(text[-limit:])
 
 
 def build_agent_prompt(item: DispatchWorkItem) -> str:
@@ -354,9 +504,15 @@ def run_agent_dispatch(
     instance_id: str,
     dispatch_id: str,
     runner: Runner | None = None,
-    timeout_s: float = 3600,
+    timeout_s: float | None = None,
+    soft_timeout_s: float = DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S,
+    hard_timeout_s: float | None = None,
 ) -> dict[str, Any]:
-    worker = ControlDispatchWorker(profile_id, instance_id, root, lease_ms=max(300_000, int(timeout_s * 1000) + 30_000))
+    if hard_timeout_s is None:
+        hard_timeout_s = DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S if timeout_s is None else timeout_s
+    if timeout_s is None:
+        timeout_s = hard_timeout_s
+    worker = ControlDispatchWorker(profile_id, instance_id, root, lease_ms=max(300_000, int((hard_timeout_s + AGENT_WORKER_TERMINATE_GRACE_S) * 1000) + 30_000))
     worker.heartbeat_once()
     try:
         item = worker.claim_dispatch(dispatch_id)
@@ -383,23 +539,73 @@ def run_agent_dispatch(
         cmd = _agent_command(profile_id)
         run = runner or _default_runner
         try:
-            proc = run(cmd, env=env, input_text=prompt, timeout_s=timeout_s, cwd=item.payload.get("repo_root"))
+            if runner is None:
+                proc = run(
+                    cmd,
+                    env=env,
+                    input_text=prompt,
+                    timeout_s=hard_timeout_s,
+                    soft_timeout_s=soft_timeout_s,
+                    cwd=item.payload.get("repo_root"),
+                    lease_extender=lambda: worker.extend_lease(item),
+                )
+            else:
+                proc = run(cmd, env=env, input_text=prompt, timeout_s=hard_timeout_s, cwd=item.payload.get("repo_root"))
             stdout = str(proc.get("stdout") or "")
             stderr = str(proc.get("stderr") or "")
-            returncode = int(proc.get("returncode") if proc.get("returncode") is not None else 1)
+            timed_out = bool(proc.get("hard_timed_out") or proc.get("timed_out"))
+            returncode = int(proc.get("returncode") if proc.get("returncode") is not None else (1 if not timed_out else 0))
             worker.extend_lease(item)
             run_artifact = {
                 "schema": "control_agent_run_v1",
                 "dispatch_id": dispatch_id,
                 "lease_epoch": item.lease_epoch,
                 "command": [shlex.quote(str(c)) for c in cmd],
-                "returncode": returncode,
-                "stdout_tail": cp.redact_text(stdout[-4000:]),
-                "stderr_tail": cp.redact_text(stderr[-4000:]),
+                "returncode": None if timed_out else returncode,
+                "runner_kind": "default" if runner is None else "custom",
+                "soft_timeout_s": soft_timeout_s,
+                "hard_timeout_s": hard_timeout_s,
+                "timeout_s": hard_timeout_s,
+                "soft_timeout_checks": proc.get("soft_timeout_checks") or [],
+                "stdout_tail": _text_tail(stdout),
+                "stderr_tail": _text_tail(stderr),
             }
+            if timed_out:
+                run_artifact.update(
+                    {
+                        "timed_out": True,
+                        "hard_timed_out": True,
+                        "terminated": bool(proc.get("terminated")),
+                        "killed": bool(proc.get("killed")),
+                        "post_kill_returncode": proc.get("post_kill_returncode"),
+                    }
+                )
             runtime_path = _runtime_artifact_path(item, root)
             runtime_path.write_text(json.dumps(run_artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             runtime_path.chmod(0o600)
+            if timed_out:
+                summary = f"agent subprocess hit hard timeout after {hard_timeout_s} seconds; partial work may exist and must be inspected before remediation/re-dispatch"
+                result = {
+                    "schema": "control_result_v1",
+                    "status": "action_required",
+                    "summary": summary,
+                    "artifacts": [{"path": str(runtime_path), "summary": "agent subprocess hard-timeout run log"}],
+                    "tests": [],
+                    "blockers": [
+                        {
+                            "kind": "hard_timeout",
+                            "message": summary,
+                            "timeout_kind": "hard",
+                            "timeout_s": hard_timeout_s,
+                            "hard_timeout_s": hard_timeout_s,
+                            "soft_timeout_s": soft_timeout_s,
+                            "partial_work_may_exist": True,
+                        }
+                    ],
+                }
+                worker.record_artifacts(item, result.get("artifacts", []))
+                worker.fail(item, result.get("summary") or "agent worker failed", result=result)
+                return {"dispatch_id": dispatch_id, "lease_epoch": item.lease_epoch, "result": result}
             if returncode != 0:
                 raise RuntimeError(f"agent subprocess exited {returncode}: {stderr[-500:] or stdout[-500:]}")
             try:
@@ -414,6 +620,37 @@ def run_agent_dispatch(
                 raise exc
             result.setdefault("artifacts", [])
             result["artifacts"] = [*result["artifacts"], {"path": str(runtime_path), "summary": "agent subprocess run log"}]
+        except subprocess.TimeoutExpired as exc:
+            worker.extend_lease(item)
+            runtime_path = _runtime_artifact_path(item, root)
+            stdout_value = exc.stdout if exc.stdout is not None else getattr(exc, "output", None)
+            run_artifact = {
+                "schema": "control_agent_run_v1",
+                "dispatch_id": dispatch_id,
+                "lease_epoch": item.lease_epoch,
+                "command": [shlex.quote(str(c)) for c in cmd],
+                "returncode": None,
+                "timed_out": True,
+                "hard_timed_out": True,
+                "runner_kind": "custom",
+                "timeout_s": hard_timeout_s,
+                "hard_timeout_s": hard_timeout_s,
+                "soft_timeout_s": soft_timeout_s,
+                "soft_timeout_checks": [],
+                "stdout_tail": _text_tail(stdout_value),
+                "stderr_tail": _text_tail(exc.stderr),
+            }
+            runtime_path.write_text(json.dumps(run_artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            runtime_path.chmod(0o600)
+            summary = f"agent subprocess hit hard timeout after {hard_timeout_s} seconds; partial work may exist and must be inspected before remediation/re-dispatch"
+            result = {
+                "schema": "control_result_v1",
+                "status": "action_required",
+                "summary": summary,
+                "artifacts": [{"path": str(runtime_path), "summary": "agent subprocess timeout run log"}],
+                "tests": [],
+                "blockers": [{"kind": "hard_timeout", "message": summary, "timeout_kind": "hard", "timeout_s": hard_timeout_s, "hard_timeout_s": hard_timeout_s, "soft_timeout_s": soft_timeout_s, "partial_work_may_exist": True}],
+            }
         except Exception as exc:
             result = {
                 "schema": "control_result_v1",

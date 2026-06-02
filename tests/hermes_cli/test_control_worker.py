@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from hermes_cli import control_db as cp
-from hermes_cli.control_worker import ControlDispatchWorker, run_agent_dispatch, run_deterministic_dispatch, validate_control_result
+from hermes_cli.control_worker import (
+    DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S,
+    DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S,
+    _default_runner,
+    ControlDispatchWorker,
+    run_agent_dispatch,
+    run_deterministic_dispatch,
+    validate_control_result,
+)
 
 
 def _payload(root: Path, parent: str | None = None):
@@ -383,3 +392,92 @@ def test_agent_worker_invalid_but_parseable_control_result_is_preserved_in_runti
     assert data["invalid_control_result"]["status"] == "bogus"
     assert data["invalid_control_result"]["api_key"] == "***"
     assert "supersecretvalue" not in artifact.read_text()
+
+
+def test_agent_worker_timeout_records_action_required_result_and_runtime_artifact_with_redacted_byte_tails(tmp_path):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    did = _make_dispatch(root, repo)
+
+    def timeout_runner(cmd, *, env, input_text, timeout_s, cwd):
+        raise subprocess.TimeoutExpired(
+            cmd=cmd,
+            timeout=timeout_s,
+            output=b"partial stdout before timeout api_key=supersecretvalue\n",
+            stderr=b"partial stderr before timeout password=supersecretvalue\n",
+        )
+
+    result = run_agent_dispatch(
+        root=root,
+        profile_id="statute-worker",
+        instance_id="statute-worker:timeout",
+        dispatch_id=did,
+        runner=timeout_runner,
+        timeout_s=5,
+    )
+
+    assert result["result"]["status"] == "action_required"
+    assert result["result"]["blockers"][0]["kind"] == "hard_timeout"
+    conn = cp.connect(root=root)
+    try:
+        row = conn.execute("SELECT status FROM cp_dispatches WHERE dispatch_id=?", (did,)).fetchone()
+        assert row["status"] == "failed"
+        latest_row = cp.get_latest_dispatch_result(conn, did)
+        assert latest_row is not None
+        latest = latest_row["result"]
+        assert latest["status"] == "action_required"
+        assert latest["artifacts"]
+    finally:
+        conn.close()
+
+    artifact = root / "control-plane" / "agent-runs" / f"{did}-1.json"
+    data = json.loads(artifact.read_text())
+    assert data["schema"] == "control_agent_run_v1"
+    assert data["timed_out"] is True
+    assert data["hard_timed_out"] is True
+    assert data["runner_kind"] == "custom"
+    assert data["timeout_s"] == 5
+    assert data["hard_timeout_s"] == 5
+    assert data["soft_timeout_checks"] == []
+    assert data["returncode"] is None
+    assert "partial stdout before timeout" in data["stdout_tail"]
+    assert "partial stderr before timeout" in data["stderr_tail"]
+    assert "supersecretvalue" not in artifact.read_text()
+
+
+def test_default_agent_runner_records_soft_checks_and_hard_kills_process_group(tmp_path):
+    soft_checks = []
+    script = (
+        "import sys, time\n"
+        "sys.stdin.read()\n"
+        "print('started secret=supersecretvalue', flush=True)\n"
+        "time.sleep(5)\n"
+    )
+
+    result = _default_runner(
+        [sys.executable, "-c", script],
+        env=os.environ.copy(),
+        input_text="prompt",
+        timeout_s=0.6,
+        soft_timeout_s=0.05,
+        cwd=str(tmp_path),
+        lease_extender=lambda: soft_checks.append("extended"),
+    )
+
+    assert result["returncode"] is None
+    assert result["timed_out"] is True
+    assert result["hard_timed_out"] is True
+    assert result["terminated"] is True
+    assert result["killed"] in {True, False}
+    assert result["timeout_s"] == 0.6
+    assert result["hard_timeout_s"] == 0.6
+    assert result["soft_timeout_s"] == 0.05
+    assert result["soft_timeout_checks"]
+    assert soft_checks
+    assert "started" in result["stdout"]
+
+
+def test_agent_worker_defaults_are_ten_minute_soft_and_fifty_minute_hard():
+    assert DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S == 600.0
+    assert DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S == 3000.0

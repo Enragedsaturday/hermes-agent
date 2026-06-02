@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import time
+import argparse
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from hermes_cli.control_runtime import (
     validate_pm_runtime_mapping,
     worker_spawnability_status,
 )
+from hermes_cli.control_worker import DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S, DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S
 
 
 MUTATING = {
@@ -57,6 +59,16 @@ MUTATING = {
 
 def _print_json(obj: Any) -> None:
     print(json.dumps(obj, indent=2, sort_keys=True))
+
+
+class _StoreExplicitFloat(argparse.Action):
+    def __init__(self, option_strings, dest, **kwargs):
+        self.explicit_dest = kwargs.pop("explicit_dest")
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, float(values))
+        setattr(namespace, self.explicit_dest, True)
 
 
 def _target(args, *, temp_default: bool = False):
@@ -397,7 +409,12 @@ def cmd_control(args) -> None:
             from hermes_cli.control_worker import run_agent_dispatch, run_deterministic_dispatch
 
             if args.handler == "agent":
-                result = run_agent_dispatch(root=target.root, profile_id=args.profile_id, instance_id=args.instance_id, dispatch_id=args.dispatch_id, timeout_s=args.timeout_s)
+                hard_timeout_s = args.hard_timeout_s
+                if args.timeout_s is not None:
+                    if getattr(args, "hard_timeout_s_explicit", False) and args.timeout_s != args.hard_timeout_s:
+                        raise SystemExit("--timeout-s is a deprecated alias for --hard-timeout-s; do not pass conflicting values")
+                    hard_timeout_s = args.timeout_s
+                result = run_agent_dispatch(root=target.root, profile_id=args.profile_id, instance_id=args.instance_id, dispatch_id=args.dispatch_id, soft_timeout_s=args.soft_timeout_s, hard_timeout_s=hard_timeout_s)
             else:
                 result = run_deterministic_dispatch(root=target.root, profile_id=args.profile_id, instance_id=args.instance_id, dispatch_id=args.dispatch_id)
             result["db_path"] = str(target.db_path)
@@ -488,7 +505,8 @@ def _run_pm_events(args, target, *, runtime_profile: str):
         pm_profile=args.pm_profile_id,
         worker_profile=args.worker_profile,
         poll_interval_s=args.poll_interval_s,
-        child_timeout_s=args.child_timeout_s,
+        child_soft_timeout_s=getattr(args, "child_soft_timeout_s", DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S),
+        child_hard_timeout_s=getattr(args, "child_hard_timeout_s", getattr(args, "child_timeout_s", DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S)),
     )
     while True:
         conn = cp.connect(root=target.root)
@@ -604,7 +622,8 @@ def _dispatch_statutepm_wave(args, target, *, spawn_child=None) -> dict[str, Any
                 worker_profile=args.worker_profile,
                 spawn_child=spawn_child,
                 poll_interval_s=args.poll_interval_s,
-                child_timeout_s=args.child_timeout_s,
+                child_soft_timeout_s=getattr(args, "child_soft_timeout_s", DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S),
+                child_hard_timeout_s=getattr(args, "child_hard_timeout_s", getattr(args, "child_timeout_s", DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S)),
             )
             outcome = flow.run_dispatch(dispatch_id)
             conn = cp.connect(root=target.root)
@@ -1183,7 +1202,10 @@ def register_subparser(subparsers) -> None:
     wrun.add_argument("--profile-id", required=True)
     wrun.add_argument("--instance-id", required=True)
     wrun.add_argument("--handler", default="deterministic", choices=["deterministic", "agent"])
-    wrun.add_argument("--timeout-s", type=float, default=3600.0)
+    wrun.add_argument("--soft-timeout-s", type=float, default=DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S)
+    wrun.set_defaults(hard_timeout_s_explicit=False)
+    wrun.add_argument("--hard-timeout-s", action=_StoreExplicitFloat, explicit_dest="hard_timeout_s_explicit", default=DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S)
+    wrun.add_argument("--timeout-s", type=float, default=None, help="Deprecated alias for --hard-timeout-s")
 
     wave = sp.add_parser("wave", help="Create and optionally supervise finite wave lifecycles")
     _add_target_flags(wave)
@@ -1201,7 +1223,8 @@ def register_subparser(subparsers) -> None:
     wdisp.add_argument("--pm-instance-id", default=None)
     wdisp.add_argument("--supervisor-lease-ms", type=int, default=3_600_000)
     wdisp.add_argument("--poll-interval-s", type=float, default=1.0)
-    wdisp.add_argument("--child-timeout-s", type=float, default=600.0)
+    wdisp.add_argument("--child-soft-timeout-s", type=float, default=DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S)
+    wdisp.add_argument("--child-hard-timeout-s", type=float, default=DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S)
 
     pm = sp.add_parser("pm", help="Run PM control-plane consumers")
     _add_target_flags(pm)
@@ -1216,7 +1239,8 @@ def register_subparser(subparsers) -> None:
     pmrun.add_argument("--pm-runtime-profile", default=None)
     pmrun.add_argument("--worker-profile", default="statute-worker")
     pmrun.add_argument("--poll-interval-s", type=float, default=5.0)
-    pmrun.add_argument("--child-timeout-s", type=float, default=600.0)
+    pmrun.add_argument("--child-soft-timeout-s", type=float, default=DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S)
+    pmrun.add_argument("--child-hard-timeout-s", type=float, default=DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S)
 
     smoke = sp.add_parser("smoke-test")
     _add_target_flags(smoke, live=False)

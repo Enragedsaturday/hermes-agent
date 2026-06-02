@@ -150,6 +150,19 @@ def test_register_instance_rejects_cross_profile_instance_id_reuse(tmp_path):
         conn.close()
 
 
+def test_register_instance_refreshes_pid_on_reuse(tmp_path):
+    conn = db(tmp_path)
+    try:
+        cp.register_instance(conn, "worker-a", instance_id="same", pid=111, host="old-host")
+        cp.register_instance(conn, "worker-a", instance_id="same", pid=222, host="new-host")
+        row = conn.execute("SELECT pid, host, status FROM cp_profile_instances WHERE instance_id='same'").fetchone()
+        assert row["pid"] == 222
+        assert row["host"] == "new-host"
+        assert row["status"] == "online"
+    finally:
+        conn.close()
+
+
 def test_route_policy_default_deny_admin_only_and_deny_wins(tmp_path):
     conn = db(tmp_path)
     try:

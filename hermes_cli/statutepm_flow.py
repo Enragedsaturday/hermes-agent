@@ -7,9 +7,12 @@ from typing import Any, Callable
 
 from hermes_cli import control_db as cp
 from hermes_cli.control_contracts import ContractError, make_child_payload, validate_statute_dispatch_v1
-from hermes_cli.control_worker import CONTROL_RESULT_SUCCESS_STATUSES, DispatchWorkItem, validate_control_result
+from hermes_cli.control_worker import AGENT_WORKER_TERMINATE_GRACE_S, CONTROL_RESULT_SUCCESS_STATUSES, DispatchWorkItem, validate_control_result
 
 SpawnChild = Callable[[str, dict[str, Any], Path | None, str], int | None]
+
+PM_CHILD_TIMEOUT_GRACE_S = 30.0
+PM_PARENT_LEASE_PROCESSING_MARGIN_S = 30.0
 
 
 def _dispatch_item(row, epoch: int) -> DispatchWorkItem:
@@ -33,7 +36,9 @@ class StatutePMFlow:
         worker_profile: str = "statute-worker",
         spawn_child: SpawnChild | None = None,
         poll_interval_s: float = 1.0,
-        child_timeout_s: float = 60.0,
+        child_timeout_s: float | None = None,
+        child_soft_timeout_s: float = 600.0,
+        child_hard_timeout_s: float | None = None,
     ):
         self.root = root
         self.admin_profile = admin_profile
@@ -49,18 +54,36 @@ class StatutePMFlow:
                 child_root,
                 parent_id,
                 live=child_root is None,
-                timeout_s=self.child_timeout_s,
+                soft_timeout_s=self.child_soft_timeout_s,
+                hard_timeout_s=self.child_hard_timeout_s,
             )
         else:
             self.spawn_child = spawn_child
         self.poll_interval_s = poll_interval_s
-        self.child_timeout_s = child_timeout_s
+        self.child_soft_timeout_s = child_soft_timeout_s
+        self.child_hard_timeout_s = child_hard_timeout_s if child_hard_timeout_s is not None else (child_timeout_s if child_timeout_s is not None else 60.0)
+        self.child_timeout_s = self.child_hard_timeout_s
 
     def _connect(self):
         return cp.connect(root=self.root)
 
+    def _child_deadline_s(self, *, now_s: float) -> float:
+        return now_s + self.child_hard_timeout_s + AGENT_WORKER_TERMINATE_GRACE_S + PM_CHILD_TIMEOUT_GRACE_S
+
     def _parent_lease_ms(self) -> int:
-        return max(300_000, int((self.child_timeout_s + max(self.poll_interval_s, 0) + 30) * 1000))
+        return max(
+            300_000,
+            int(
+                (
+                    self.child_hard_timeout_s
+                    + AGENT_WORKER_TERMINATE_GRACE_S
+                    + PM_CHILD_TIMEOUT_GRACE_S
+                    + max(self.poll_interval_s, 0)
+                    + PM_PARENT_LEASE_PROCESSING_MARGIN_S
+                )
+                * 1000
+            ),
+        )
 
     def heartbeat(self, *, lease_ms: int = 120_000) -> None:
         conn = self._connect()
@@ -176,7 +199,7 @@ class StatutePMFlow:
             conn.close()
 
         pid = self.spawn_child(child_id, child_payload, self.root, parent.dispatch_id) if self.spawn_child else None
-        deadline = time.monotonic() + self.child_timeout_s
+        deadline = self._child_deadline_s(now_s=time.monotonic())
         child_row = None
         latest = None
         while True:
