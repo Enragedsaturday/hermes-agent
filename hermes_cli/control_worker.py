@@ -162,9 +162,22 @@ class ControlDispatchWorker:
         conn = self._connect()
         try:
             cp.record_result(conn, dispatch_id=item.dispatch_id, instance_id=self.instance_id, lease_epoch=item.lease_epoch, result=failure_result)
-            ok = cp.advance_dispatch(conn, item.dispatch_id, instance_id=self.instance_id, lease_epoch=item.lease_epoch, status="failed", last_error=error)
+            result_status = failure_result.get("status")
+            blocker_kinds = {str(blocker.get("kind") or "") for blocker in failure_result.get("blockers", []) if isinstance(blocker, dict)}
+            deliberate_action_required = result_status == "action_required" and "hard_timeout" not in blocker_kinds
+            dispatch_status = "blocked" if deliberate_action_required else "failed"
+            event_status = "blocked" if dispatch_status == "blocked" else "failed"
+            last_error = failure_result.get("summary") if dispatch_status == "blocked" else error
+            ok = cp.advance_dispatch(
+                conn,
+                item.dispatch_id,
+                instance_id=self.instance_id,
+                lease_epoch=item.lease_epoch,
+                status=dispatch_status,
+                last_error=str(last_error or error),
+            )
             if ok:
-                cp.emit_status(conn, instance_id=self.instance_id, dispatch_id=item.dispatch_id, status="failed", summary=error)
+                cp.emit_status(conn, instance_id=self.instance_id, dispatch_id=item.dispatch_id, status=event_status, summary=str(last_error or error))
             return ok
         finally:
             conn.close()
@@ -371,6 +384,91 @@ def _text_tail(value: Any, *, limit: int = AGENT_RUN_TAIL_CHARS) -> str:
     return cp.redact_text(text[-limit:])
 
 
+def _path_within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _is_bounded_wave_payload(payload: dict[str, Any]) -> bool:
+    constraints = payload.get("constraints") or {}
+    if not isinstance(constraints, dict):
+        return False
+    if constraints.get("wave"):
+        return True
+    sprint_ids = constraints.get("sprint_ids")
+    return isinstance(sprint_ids, list) and len(sprint_ids) > 1
+
+
+def _post_wave_closeout_instructions(payload: dict[str, Any]) -> str:
+    if not _is_bounded_wave_payload(payload):
+        return ""
+    return (
+        "\nPost-wave closeout requirements for bounded NJ Statutes waves:\n"
+        "- Execute the dispatched wave first. Do not start the next wave from inside this wave.\n"
+        "- After the wave is otherwise complete, identify whether there were any control plane issues by inspecting parent/child dispatch rows, result rows, messages to default, open blockers, agent-run artifacts, handoff files, and relevant local logs for this wave.\n"
+        "- If any control plane issue exists, handle it before final success using this exact loop: research -> diagnose -> plan -> write executable proposal -> looped oppositional review scoped only to the issue/proposal -> finalize proposal -> implement proposal -> review implementation -> fix any implementation errors found.\n"
+        "- Identify the next wave from the executable contract ledger after closeout, starting from the current ready sprint; do not stop at a one-sprint prompt unless the next executable wave is genuinely one sprint. Run: /Users/johngalt/.hermes/hermes-agent/venv/bin/python /Users/johngalt/.hermes/profiles/nj-statutes-pm/scripts/autonomous_contract.py ready --db .contract-ledger/state.sqlite\n"
+        "- Determine the next wave boundary from the executable contract and ledger state: include the ready sprint plus sequential dependent sprints that belong in the same bounded wave, respect stop conditions/gates/parallelSafety/scope, and hard-stop before the following wave. Do not infer the next wave from the just-completed sprint_ids list.\n"
+        "- Write the full next-wave dispatch markdown file under docs/dispatches/ so Benjamin can provide it to Galt in a fresh Discord thread.\n"
+        "- Include that markdown dispatch file in control_result_v1.artifacts as an existing .md path under docs/dispatches/.\n"
+        "- If the next dispatch markdown cannot be produced because no next wave is ready, the repo/control plane is blocked, or permissions/scope prevent writing it, return status=action_required with blocker kind next_dispatch_prompt_missing.\n"
+    )
+
+
+def _bounded_wave_dispatch_artifact_problem(item: DispatchWorkItem, result: dict[str, Any]) -> str | None:
+    if not _is_bounded_wave_payload(item.payload):
+        return None
+    if result.get("status") not in CONTROL_RESULT_SUCCESS_STATUSES:
+        return None
+    payload = validate_statute_dispatch_v1(item.payload, require_parent=bool(item.payload.get("parent_dispatch_id")))
+    if "write" not in set(payload.get("task_permissions") or []):
+        return "bounded wave requires write permission to produce docs/dispatches next-dispatch markdown"
+    repo_root = Path(payload["repo_root"]).resolve(strict=False)
+    dispatch_dir = (repo_root / "docs" / "dispatches").resolve(strict=False)
+    allowed_paths = [Path(path).resolve(strict=False) for path in payload.get("allowed_paths") or []]
+    if not any(_path_within(dispatch_dir, allowed) for allowed in allowed_paths):
+        return "bounded wave requires docs/dispatches/ to be within dispatch allowed_paths"
+    for artifact in result.get("artifacts") or []:
+        if not isinstance(artifact, dict) or not artifact.get("path"):
+            continue
+        raw_artifact_path = Path(str(artifact["path"])).expanduser()
+        artifact_path = (repo_root / raw_artifact_path if not raw_artifact_path.is_absolute() else raw_artifact_path).resolve(strict=False)
+        if artifact_path.suffix != ".md":
+            continue
+        if not _path_within(artifact_path, dispatch_dir):
+            continue
+        if not any(_path_within(artifact_path, allowed) for allowed in allowed_paths):
+            continue
+        if artifact_path.is_file():
+            return None
+    return "bounded wave completed without required existing docs/dispatches/*.md next-dispatch artifact"
+
+
+def _enforce_bounded_wave_postcondition(item: DispatchWorkItem, result: dict[str, Any]) -> dict[str, Any]:
+    problem = _bounded_wave_dispatch_artifact_problem(item, result)
+    if not problem:
+        return result
+    return {
+        "schema": "control_result_v1",
+        "status": "action_required",
+        "summary": "bounded wave completed without required next-dispatch markdown artifact",
+        "artifacts": list(result.get("artifacts") or []),
+        "tests": list(result.get("tests") or []),
+        "blockers": [
+            *list(result.get("blockers") or []),
+            {
+                "kind": "next_dispatch_prompt_missing",
+                "message": problem,
+                "required_directory": "docs/dispatches/",
+                "required_suffix": ".md",
+            },
+        ],
+    }
+
+
 def build_agent_prompt(item: DispatchWorkItem) -> str:
     payload = validate_statute_dispatch_v1(item.payload, require_parent=bool(item.payload.get("parent_dispatch_id")))
     return (
@@ -383,6 +481,7 @@ def build_agent_prompt(item: DispatchWorkItem) -> str:
         "artifacts must be an array of objects like {path, summary, metadata}; tests must be an array of objects like {command, exit_code, summary}; blockers must be an array of objects like {kind, message}.\n\n"
         "Dispatch payload JSON:\n"
         f"{json.dumps(payload, indent=2, sort_keys=True)}\n"
+        f"{_post_wave_closeout_instructions(payload)}"
     )
 
 
@@ -618,6 +717,7 @@ def run_agent_dispatch(
                 except Exception:
                     pass
                 raise exc
+            result = _enforce_bounded_wave_postcondition(item, result)
             result.setdefault("artifacts", [])
             result["artifacts"] = [*result["artifacts"], {"path": str(runtime_path), "summary": "agent subprocess run log"}]
         except subprocess.TimeoutExpired as exc:

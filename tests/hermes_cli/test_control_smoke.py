@@ -157,7 +157,7 @@ def test_statutepm_wave_supervises_exact_dispatch_and_offlines_finite_instances(
         return 11
 
     result = _dispatch_statutepm_wave(_wave_args(payload, key="new-wave"), target, spawn_child=fake_spawn)
-    assert result["status"] == "supervised"
+    assert result["status"] == "completed"
     assert result["parent_status"] == "completed"
     assert result["supervisor_offline"] is True
     assert spawned
@@ -175,6 +175,59 @@ def test_statutepm_wave_supervises_exact_dispatch_and_offlines_finite_instances(
         assert rows[result["pm_instance_id"]]["status"] == "offline"
         assert conn.execute("SELECT status FROM cp_dispatches WHERE dispatch_id=?", (old,)).fetchone()["status"] == "pending"
         assert conn.execute("SELECT status FROM cp_dispatches WHERE dispatch_id=?", (result["parent_dispatch_id"],)).fetchone()["status"] == "completed"
+    finally:
+        conn.close()
+
+
+def test_statutepm_wave_supervised_status_mirrors_action_required_child(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"nj-statutes-pm", "statute-worker"})
+    target = resolve_control_target(root=root)
+    payload = _sample_payload(repo)
+    action_result = {
+        "schema": "control_result_v1",
+        "status": "action_required",
+        "summary": "child needs CodeRabbit auth",
+        "artifacts": [],
+        "tests": [],
+        "blockers": [{"kind": "auth", "message": "CodeRabbit auth required"}],
+    }
+
+    def fake_spawn(child_id, child_payload, child_root, parent_id):
+        conn = cp.connect(root=child_root)
+        try:
+            cp.register_instance(conn, "statute-worker", instance_id="statute-worker:wave-action")
+            ok, epoch = cp.claim_dispatch_by_id(conn, dispatch_id=child_id, instance_id="statute-worker:wave-action")
+            assert ok and epoch == 1
+            cp.advance_dispatch(conn, child_id, instance_id="statute-worker:wave-action", lease_epoch=epoch, status="running")
+            cp.record_result(conn, dispatch_id=child_id, instance_id="statute-worker:wave-action", lease_epoch=epoch, result=action_result)
+            cp.advance_dispatch(conn, child_id, instance_id="statute-worker:wave-action", lease_epoch=epoch, status="blocked", last_error="child needs CodeRabbit auth")
+        finally:
+            conn.close()
+        return 12
+
+    result = _dispatch_statutepm_wave(_wave_args(payload, key="action-wave"), target, spawn_child=fake_spawn)
+    assert result["status"] == "action_required"
+    assert result["parent_status"] == "blocked"
+    assert result["supervision"]["status"] == "action_required"
+    repeat = _dispatch_statutepm_wave(_wave_args(payload, key="action-wave"), target, spawn_child=fake_spawn)
+    assert repeat["parent_dispatch_id"] == result["parent_dispatch_id"]
+    assert repeat["status"] == "action_required"
+    assert repeat["parent_status"] == "blocked"
+    assert repeat["supervision"]["already_terminal"] is True
+
+    conn = cp.connect(root=root)
+    try:
+        parent = conn.execute("SELECT status FROM cp_dispatches WHERE dispatch_id=?", (result["parent_dispatch_id"],)).fetchone()
+        assert parent is not None
+        assert parent["status"] == "blocked"
+        latest_row = cp.get_latest_dispatch_result(conn, result["parent_dispatch_id"])
+        assert latest_row is not None
+        latest = latest_row["result"]
+        assert latest["status"] == "action_required"
+        assert latest["summary"] == "child needs CodeRabbit auth"
     finally:
         conn.close()
 

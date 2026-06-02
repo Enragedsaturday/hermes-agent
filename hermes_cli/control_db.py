@@ -60,7 +60,7 @@ _TEXT_COLUMNS = {
 }
 
 _ADMIN_ACTOR_TYPES = {"admin", "bootstrap"}
-_DISPATCH_ADVANCE_STATUSES = {"running", "completed", "failed"}
+_DISPATCH_ADVANCE_STATUSES = {"running", "completed", "failed", "blocked"}
 _CLAIMABLE_DISPATCH_STATUSES = {"pending", "retry_ready"}
 ACTIVE_MESSAGE_STATUSES = {"pending", "delivered"}
 TERMINAL_MESSAGE_STATUSES = {"acknowledged", "resolved", "superseded", "cancelled"}

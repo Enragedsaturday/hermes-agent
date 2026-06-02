@@ -189,6 +189,43 @@ def test_statutepm_preserves_child_action_required_result_when_child_dispatch_fa
         return 9
 
     outcome = StatutePMFlow(root=root, pm_instance_id="statutepm:failed-child-action", spawn_child=spawn, poll_interval_s=0, child_timeout_s=2).run_dispatch(parent)
+    assert outcome["status"] == "action_required"
+
+    conn = cp.connect(root=root)
+    try:
+        row = conn.execute("SELECT status, last_error FROM cp_dispatches WHERE dispatch_id=?", (parent,)).fetchone()
+        assert row["status"] == "blocked"
+        assert "requires action" in row["last_error"]
+        latest_row = cp.get_latest_dispatch_result(conn, parent)
+        assert latest_row is not None
+        latest = latest_row["result"]
+        assert latest["status"] == "action_required"
+        assert latest["summary"] == "child blocked on CodeRabbit"
+        assert latest["blockers"][0]["message"] == "CodeRabbit retry required"
+        assert latest["blockers"][-1]["child_dispatch_status"] == "failed"
+    finally:
+        conn.close()
+
+
+def test_statutepm_child_hard_timeout_action_required_result_remains_failed(tmp_path):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    parent = _create_parent(root, repo)
+    result = {
+        "schema": "control_result_v1",
+        "status": "action_required",
+        "summary": "agent subprocess hit hard timeout after 5 seconds; partial work may exist",
+        "artifacts": [],
+        "tests": [],
+        "blockers": [{"kind": "hard_timeout", "message": "agent subprocess hit hard timeout"}],
+    }
+
+    def spawn(child_id: str, payload: dict, child_root: Path | None, parent_id: str) -> int:
+        _finish_child_with_result(child_id, child_root, result, status="failed")
+        return 11
+
+    outcome = StatutePMFlow(root=root, pm_instance_id="statutepm:failed-child-hard-timeout", spawn_child=spawn, poll_interval_s=0, child_timeout_s=2).run_dispatch(parent)
     assert outcome["status"] == "failed"
 
     conn = cp.connect(root=root)
@@ -200,8 +237,8 @@ def test_statutepm_preserves_child_action_required_result_when_child_dispatch_fa
         assert latest_row is not None
         latest = latest_row["result"]
         assert latest["status"] == "action_required"
-        assert latest["summary"] == "child blocked on CodeRabbit"
-        assert latest["blockers"][0]["message"] == "CodeRabbit retry required"
+        assert latest["summary"] == result["summary"]
+        assert latest["blockers"][0]["kind"] == "hard_timeout"
         assert latest["blockers"][-1]["child_dispatch_status"] == "failed"
     finally:
         conn.close()

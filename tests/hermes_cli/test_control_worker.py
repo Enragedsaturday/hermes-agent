@@ -11,7 +11,9 @@ from hermes_cli.control_worker import (
     DEFAULT_AGENT_WORKER_HARD_TIMEOUT_S,
     DEFAULT_AGENT_WORKER_SOFT_TIMEOUT_S,
     _default_runner,
+    build_agent_prompt,
     ControlDispatchWorker,
+    DispatchWorkItem,
     run_agent_dispatch,
     run_deterministic_dispatch,
     validate_control_result,
@@ -30,6 +32,19 @@ def _payload(root: Path, parent: str | None = None):
         "instructions": "work",
         "constraints": {"no_live_db_mutation": True, "no_push": True},
     }
+
+
+def _wave_payload(root: Path, *, parent: str | None = "disp_parent", write: bool = True, allowed_paths: list[str] | None = None):
+    payload = _payload(root, parent=parent)
+    payload["task_permissions"] = ["read", "test", *(["write"] if write else [])]
+    payload["allowed_paths"] = allowed_paths or [str(root)]
+    payload["constraints"] = {
+        "no_live_db_mutation": True,
+        "no_push": True,
+        "wave": "F.1-F.5",
+        "sprint_ids": ["F.1", "F.2", "F.3", "F.4", "F.5"],
+    }
+    return payload
 
 
 def test_control_worker_claims_records_artifact_and_completes(tmp_path):
@@ -109,6 +124,7 @@ def test_agent_worker_builds_prompt_runs_subprocess_and_records_result(tmp_path)
     assert "--ignore-rules" not in calls["cmd"]
     assert "--yolo" not in calls["cmd"]
     assert "--resume" not in calls["cmd"]
+    assert "Post-wave closeout requirements" not in calls["input_text"]
 
     conn = cp.connect(root=root)
     try:
@@ -120,6 +136,48 @@ def test_agent_worker_builds_prompt_runs_subprocess_and_records_result(tmp_path)
         assert inst["status"] == "offline"
     finally:
         conn.close()
+
+
+def test_bounded_wave_prompt_includes_post_wave_closeout_requirements(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    item = DispatchWorkItem(
+        dispatch_id="disp_wave",
+        sender_profile="statutepm",
+        receiver_profile="statute-worker",
+        lease_epoch=1,
+        payload=_wave_payload(repo),
+    )
+
+    prompt = build_agent_prompt(item)
+
+    assert "Post-wave closeout requirements" in prompt
+    assert "research -> diagnose -> plan -> write executable proposal -> looped oppositional review" in prompt
+    assert "Identify the next wave" in prompt
+    assert "Determine the next wave boundary" in prompt
+    assert "do not stop at a one-sprint prompt" in prompt
+    assert "autonomous_contract.py ready --db .contract-ledger/state.sqlite" in prompt
+    assert "docs/dispatches/" in prompt
+    assert "next_dispatch_prompt_missing" in prompt
+
+
+def test_single_sprint_prompt_does_not_include_post_wave_closeout_requirements(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _wave_payload(repo)
+    payload["constraints"].pop("wave")
+    payload["constraints"]["sprint_ids"] = ["F.1"]
+    item = DispatchWorkItem(
+        dispatch_id="disp_single",
+        sender_profile="statutepm",
+        receiver_profile="statute-worker",
+        lease_epoch=1,
+        payload=payload,
+    )
+
+    prompt = build_agent_prompt(item)
+
+    assert "Post-wave closeout requirements" not in prompt
 
 
 def test_agent_worker_fails_malformed_success_output(tmp_path):
@@ -142,6 +200,10 @@ def test_agent_worker_fails_malformed_success_output(tmp_path):
 
 
 def _make_dispatch(root: Path, repo: Path) -> str:
+    return _make_dispatch_with_payload(root, _payload(repo, parent="disp_parent"))
+
+
+def _make_dispatch_with_payload(root: Path, payload: dict) -> str:
     conn = cp.connect(root=root)
     try:
         cp.bootstrap_statutepm_policies(conn, seed_instances=True)
@@ -149,7 +211,7 @@ def _make_dispatch(root: Path, repo: Path) -> str:
             conn,
             sender_instance_id="statutepm:bootstrap",
             receiver_profile="statute-worker",
-            payload=_payload(repo, parent="disp_parent"),
+            payload=payload,
         )
     finally:
         conn.close()
@@ -160,6 +222,146 @@ def _runner_for_result(result: dict):
         return {"returncode": 0, "stdout": "CONTROL_RESULT_JSON:" + json.dumps(result), "stderr": ""}
 
     return fake_runner
+
+
+def test_bounded_wave_success_without_dispatch_markdown_blocks_child(tmp_path):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    did = _make_dispatch_with_payload(root, _wave_payload(repo))
+    result = {
+        "schema": "control_result_v1",
+        "status": "completed",
+        "summary": "wave complete",
+        "artifacts": [],
+        "tests": [{"command": "fake", "exit_code": 0}],
+        "blockers": [],
+    }
+
+    actual = run_agent_dispatch(root=root, profile_id="statute-worker", instance_id="statute-worker:wave-missing", dispatch_id=did, runner=_runner_for_result(result), timeout_s=5)
+
+    assert actual["result"]["status"] == "action_required"
+    blocker = actual["result"]["blockers"][-1]
+    assert blocker["kind"] == "next_dispatch_prompt_missing"
+    conn = cp.connect(root=root)
+    try:
+        row = conn.execute("SELECT status FROM cp_dispatches WHERE dispatch_id=?", (did,)).fetchone()
+        assert row["status"] == "blocked"
+    finally:
+        conn.close()
+
+
+def test_bounded_wave_success_with_dispatch_markdown_completes(tmp_path):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    dispatch_dir = repo / "docs" / "dispatches"
+    dispatch_dir.mkdir(parents=True)
+    dispatch_file = dispatch_dir / "g1-next-wave-dispatch.md"
+    dispatch_file.write_text("# next dispatch\n", encoding="utf-8")
+    did = _make_dispatch_with_payload(root, _wave_payload(repo))
+    result = {
+        "schema": "control_result_v1",
+        "status": "completed",
+        "summary": "wave complete",
+        "artifacts": [{"path": str(dispatch_file), "summary": "next dispatch"}],
+        "tests": [{"command": "fake", "exit_code": 0}],
+        "blockers": [],
+    }
+
+    actual = run_agent_dispatch(root=root, profile_id="statute-worker", instance_id="statute-worker:wave-ok", dispatch_id=did, runner=_runner_for_result(result), timeout_s=5)
+
+    assert actual["result"]["status"] == "completed"
+    conn = cp.connect(root=root)
+    try:
+        row = conn.execute("SELECT status FROM cp_dispatches WHERE dispatch_id=?", (did,)).fetchone()
+        assert row["status"] == "completed"
+    finally:
+        conn.close()
+
+
+def test_bounded_wave_success_with_repo_relative_dispatch_markdown_completes(tmp_path):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    dispatch_dir = repo / "docs" / "dispatches"
+    dispatch_dir.mkdir(parents=True)
+    dispatch_file = dispatch_dir / "g1-next-wave-dispatch.md"
+    dispatch_file.write_text("# next dispatch\n", encoding="utf-8")
+    did = _make_dispatch_with_payload(root, _wave_payload(repo))
+    result = {
+        "schema": "control_result_v1",
+        "status": "completed",
+        "summary": "wave complete",
+        "artifacts": [{"path": "docs/dispatches/g1-next-wave-dispatch.md", "summary": "next dispatch"}],
+        "tests": [{"command": "fake", "exit_code": 0}],
+        "blockers": [],
+    }
+
+    actual = run_agent_dispatch(root=root, profile_id="statute-worker", instance_id="statute-worker:wave-relative-ok", dispatch_id=did, runner=_runner_for_result(result), timeout_s=5)
+
+    assert actual["result"]["status"] == "completed"
+
+
+def test_bounded_wave_success_without_write_permission_blocks_even_with_file(tmp_path):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    dispatch_dir = repo / "docs" / "dispatches"
+    dispatch_dir.mkdir(parents=True)
+    dispatch_file = dispatch_dir / "g1-next-wave-dispatch.md"
+    dispatch_file.write_text("# next dispatch\n", encoding="utf-8")
+    did = _make_dispatch_with_payload(root, _wave_payload(repo, write=False))
+    result = {
+        "schema": "control_result_v1",
+        "status": "completed",
+        "summary": "wave complete",
+        "artifacts": [{"path": str(dispatch_file), "summary": "next dispatch"}],
+        "tests": [],
+        "blockers": [],
+    }
+
+    actual = run_agent_dispatch(root=root, profile_id="statute-worker", instance_id="statute-worker:wave-no-write", dispatch_id=did, runner=_runner_for_result(result), timeout_s=5)
+
+    assert actual["result"]["status"] == "action_required"
+    assert actual["result"]["blockers"][-1]["kind"] == "next_dispatch_prompt_missing"
+    assert "write permission" in actual["result"]["blockers"][-1]["message"]
+
+
+def test_non_wave_success_without_dispatch_markdown_still_completes(tmp_path):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    did = _make_dispatch(root, repo)
+    result = {
+        "schema": "control_result_v1",
+        "status": "completed",
+        "summary": "single sprint complete",
+        "artifacts": [],
+        "tests": [],
+        "blockers": [],
+    }
+
+    actual = run_agent_dispatch(root=root, profile_id="statute-worker", instance_id="statute-worker:single-ok", dispatch_id=did, runner=_runner_for_result(result), timeout_s=5)
+
+    assert actual["result"]["status"] == "completed"
+
+
+def test_bounded_wave_action_required_result_is_preserved(tmp_path):
+    root = tmp_path / ".hermes"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    did = _make_dispatch_with_payload(root, _wave_payload(repo))
+    result = {
+        "schema": "control_result_v1",
+        "status": "action_required",
+        "summary": "CodeRabbit auth required",
+        "artifacts": [],
+        "tests": [],
+        "blockers": [{"kind": "auth", "message": "CodeRabbit auth required"}],
+    }
+
+    actual = run_agent_dispatch(root=root, profile_id="statute-worker", instance_id="statute-worker:wave-action", dispatch_id=did, runner=_runner_for_result(result), timeout_s=5)
+
+    assert actual["result"]["status"] == "action_required"
+    assert [blocker["kind"] for blocker in actual["result"]["blockers"]] == ["auth"]
 
 
 def test_validate_control_result_accepts_completed_with_warnings():
@@ -280,7 +482,7 @@ def test_agent_worker_completed_with_warnings_marks_dispatch_completed_and_prese
         conn.close()
 
 
-def test_agent_worker_action_required_records_failed_dispatch_but_preserves_action_required_result(tmp_path):
+def test_agent_worker_action_required_records_blocked_dispatch_and_preserves_action_required_result(tmp_path):
     root = tmp_path / ".hermes"
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -298,11 +500,15 @@ def test_agent_worker_action_required_records_failed_dispatch_but_preserves_acti
 
     conn = cp.connect(root=root)
     try:
-        row = conn.execute("SELECT status FROM cp_dispatches WHERE dispatch_id=?", (did,)).fetchone()
-        assert row["status"] == "failed"
+        row = conn.execute("SELECT status,last_error FROM cp_dispatches WHERE dispatch_id=?", (did,)).fetchone()
+        assert row["status"] == "blocked"
+        assert row["last_error"] == "needs supervisor"
         latest = cp.get_latest_dispatch_result(conn, did)["result"]
         assert latest["status"] == "action_required"
         assert latest["blockers"][0]["kind"] == "decision"
+        status_event = conn.execute("SELECT status,summary FROM cp_status_events WHERE dispatch_id=? ORDER BY created_at_ms DESC LIMIT 1", (did,)).fetchone()
+        assert status_event["status"] == "blocked"
+        assert status_event["summary"] == "needs supervisor"
     finally:
         conn.close()
 
@@ -326,7 +532,7 @@ def test_agent_worker_unknown_blocked_status_records_action_required_with_raw_st
     conn = cp.connect(root=root)
     try:
         row = conn.execute("SELECT status FROM cp_dispatches WHERE dispatch_id=?", (did,)).fetchone()
-        assert row["status"] == "failed"
+        assert row["status"] == "blocked"
         latest_row = cp.get_latest_dispatch_result(conn, did)
         assert latest_row is not None
         latest = latest_row["result"]

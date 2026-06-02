@@ -25,6 +25,10 @@ def _dispatch_item(row, epoch: int) -> DispatchWorkItem:
     )
 
 
+def _has_blocker_kind(result: dict[str, Any], kind: str) -> bool:
+    return any(isinstance(blocker, dict) and blocker.get("kind") == kind for blocker in result.get("blockers", []))
+
+
 class StatutePMFlow:
     def __init__(
         self,
@@ -143,8 +147,9 @@ class StatutePMFlow:
                     return {"parent_dispatch_id": parent_dispatch_id, "status": "missing"}
                 if row["receiver_profile"] != self.pm_profile:
                     return {"parent_dispatch_id": parent_dispatch_id, "status": "wrong_receiver", "receiver_profile": row["receiver_profile"]}
-                if row["status"] in {"completed", "failed", "dead_letter"}:
-                    return {"parent_dispatch_id": parent_dispatch_id, "status": row["status"], "already_terminal": True}
+                if row["status"] in {"completed", "failed", "blocked", "dead_letter"}:
+                    outcome_status = "action_required" if row["status"] == "blocked" else row["status"]
+                    return {"parent_dispatch_id": parent_dispatch_id, "status": outcome_status, "dispatch_status": row["status"], "already_terminal": True}
                 ok, epoch = cp.claim_dispatch_by_id(conn, dispatch_id=parent_dispatch_id, instance_id=self.pm_instance_id, lease_ms=parent_lease_ms)
                 if not ok or epoch is None:
                     current = conn.execute("SELECT status, lease_instance_id, lease_epoch FROM cp_dispatches WHERE dispatch_id=?", (parent_dispatch_id,)).fetchone()
@@ -210,7 +215,7 @@ class StatutePMFlow:
                 cp.reap_expired_dispatches(conn)
                 child_row = conn.execute("SELECT * FROM cp_dispatches WHERE dispatch_id=?", (child_id,)).fetchone()
                 latest = cp.get_latest_dispatch_result(conn, child_id)
-                if child_row and child_row["status"] in {"completed", "failed", "dead_letter"}:
+                if child_row and child_row["status"] in {"completed", "failed", "blocked", "dead_letter"}:
                     break
             finally:
                 conn.close()
@@ -221,6 +226,30 @@ class StatutePMFlow:
         conn = self._connect()
         try:
             child_status = child_row["status"] if child_row else "missing"
+            if latest:
+                try:
+                    candidate_child_result = validate_control_result(latest["result"])
+                except Exception:
+                    candidate_child_result = None
+                if candidate_child_result and candidate_child_result.get("status") == "action_required" and not _has_blocker_kind(candidate_child_result, "hard_timeout"):
+                    blocker = {
+                        "kind": "runtime_error",
+                        "message": f"child dispatch {child_id} requires action status={child_status}",
+                        "child_dispatch_id": child_id,
+                        "child_dispatch_status": child_status,
+                    }
+                    result = _result(
+                        "action_required",
+                        candidate_child_result.get("summary") or "child dispatch requires action",
+                        artifacts=candidate_child_result.get("artifacts", []),
+                        tests=candidate_child_result.get("tests", []),
+                        blockers=[*candidate_child_result.get("blockers", []), blocker],
+                    )
+                    cp.record_result(conn, dispatch_id=parent.dispatch_id, instance_id=self.pm_instance_id, lease_epoch=parent.lease_epoch, result=result)
+                    cp.create_message_from_instance(conn, sender_instance_id=self.pm_instance_id, receiver_profile=self.admin_profile, kind="action_required", body=json.dumps(result, sort_keys=True))
+                    cp.advance_dispatch(conn, parent.dispatch_id, instance_id=self.pm_instance_id, lease_epoch=parent.lease_epoch, status="blocked", last_error=blocker["message"])
+                    return {"parent_dispatch_id": parent.dispatch_id, "child_dispatch_id": child_id, "status": "action_required", "pid": pid}
+
             if child_status != "completed" or not latest:
                 if latest:
                     try:

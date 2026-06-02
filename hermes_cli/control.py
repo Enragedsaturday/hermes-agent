@@ -461,7 +461,7 @@ def cmd_control(args) -> None:
         if command == "wave" and sub == "dispatch-statutepm":
             result = _dispatch_statutepm_wave(args, target)
             _print_json(result)
-            if result.get("status") in {"invalid_payload", "failed"}:
+            if result.get("status") in {"invalid_payload", "failed", "action_required", "blocked"}:
                 raise SystemExit(1)
             return
         if command == "readiness":
@@ -634,10 +634,13 @@ def _dispatch_statutepm_wave(args, target, *, spawn_child=None) -> dict[str, Any
                 conn.close()
 
         if not result:
+            status = "created"
+            if args.supervise:
+                status = outcome.get("status", "supervised") if outcome else "supervised"
             result = {
                 "db_path": str(target.db_path),
                 "live": target.live,
-                "status": "supervised" if args.supervise else "created",
+                "status": status,
                 "parent_dispatch_id": dispatch_id,
                 "parent_status": parent_status,
                 "supervisor_instance_id": supervisor_instance_id,

@@ -311,6 +311,25 @@ def test_dispatch_claim_is_single_winner_and_epoch_fenced(tmp_path):
         conn.close()
 
 
+def test_dispatch_can_advance_to_blocked_and_emits_event(tmp_path):
+    conn = db(tmp_path)
+    try:
+        cp.add_route_policy(conn, effect="allow", created_by_type="bootstrap", sender_profile="default", receiver_profile="worker", kind="dispatch", capability="dispatch", priority=1)
+        inst = cp.register_instance(conn, "worker", instance_id="i1")
+        did = cp.create_dispatch(conn, sender_profile="default", receiver_profile="worker", payload={"task": "x"})
+        ok, epoch = cp.claim_dispatch(conn, did, instance_id=inst)
+        assert ok and epoch == 1
+        assert cp.advance_dispatch(conn, did, instance_id=inst, lease_epoch=epoch, status="blocked", last_error="needs supervisor") is True
+        row = conn.execute("SELECT status,last_error FROM cp_dispatches WHERE dispatch_id=?", (did,)).fetchone()
+        assert row["status"] == "blocked"
+        assert row["last_error"] == "needs supervisor"
+        event = conn.execute("SELECT event_type,event_json FROM cp_dispatch_events WHERE dispatch_id=? AND event_type='blocked'", (did,)).fetchone()
+        assert event is not None
+        assert json.loads(event["event_json"])["status"] == "blocked"
+    finally:
+        conn.close()
+
+
 def test_dispatch_advance_requires_live_lease_and_valid_status(tmp_path):
     conn = db(tmp_path)
     try:
