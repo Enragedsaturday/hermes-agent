@@ -372,7 +372,10 @@ class TestWebToolPolicy:
         from plugins.web.firecrawl import provider as firecrawl_provider
 
         # Allow test URLs past SSRF check so website policy is what gets tested
-        monkeypatch.setattr(web_tools, "is_safe_url", lambda url: True)
+        async def _allow_ssrf(_url: str) -> bool:
+            return True
+
+        monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_ssrf)
         # The per-URL website-policy gate moved into the firecrawl plugin's
         # extract() during the web-provider migration. Patch it at the new
         # location.
@@ -394,6 +397,7 @@ class TestWebToolPolicy:
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
         # Force the firecrawl plugin to be the active extract provider.
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
+        monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "firecrawl")
 
         result = json.loads(await web_tools.web_extract_tool(["https://blocked.test"], use_llm_processing=False))
 
@@ -406,7 +410,10 @@ class TestWebToolPolicy:
         from plugins.web.firecrawl import provider as firecrawl_provider
 
         # Allow test URLs past SSRF check so website policy is what gets tested
-        monkeypatch.setattr(web_tools, "is_safe_url", lambda url: True)
+        async def _allow_ssrf(_url: str) -> bool:
+            return True
+
+        monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_ssrf)
 
         def fake_check(url):
             if url == "https://allowed.test":
@@ -436,6 +443,7 @@ class TestWebToolPolicy:
         monkeypatch.setattr(firecrawl_provider, "_get_firecrawl_client", lambda: FakeFirecrawlClient())
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
+        monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "firecrawl")
 
         result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"], use_llm_processing=False))
 

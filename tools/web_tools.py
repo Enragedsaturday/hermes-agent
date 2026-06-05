@@ -102,8 +102,12 @@ from tools.managed_tool_gateway import (  # noqa: F401 — backward-compat names
     read_nous_access_token as _read_nous_access_token,
     resolve_managed_tool_gateway,
 )
-from tools.tool_backend_helpers import managed_nous_tools_enabled, prefers_gateway  # noqa: F401
-from tools.url_safety import is_safe_url
+from tools.tool_backend_helpers import (  # noqa: F401
+    managed_nous_tools_enabled,
+    nous_tool_gateway_unavailable_message,
+    prefers_gateway,
+)
+from tools.url_safety import async_is_safe_url, is_safe_url
 import sys
 
 logger = logging.getLogger(__name__)
@@ -937,7 +941,7 @@ async def web_extract_tool(
         safe_urls = []
         ssrf_blocked: List[Dict[str, Any]] = []
         for url in urls:
-            if not is_safe_url(url):
+            if not await async_is_safe_url(url):
                 ssrf_blocked.append({
                     "url": url, "title": "", "content": "",
                     "error": "Blocked: URL targets a private or internal network address",
