@@ -11,8 +11,20 @@ on:
       - 'optional-skills/**'
       - '.github/workflows/deploy-site.yml'
   workflow_dispatch:
+    inputs:
+      skills_index_run_id:
+        description: 'Optional Build Skills Index run ID whose skills-index artifact should be deployed'
+        required: false
+        type: string
+      rebuild_skills_index:
+        description: 'Force a fresh multi-source crawl instead of reusing the latest healthy index'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
+  contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -55,9 +67,12 @@ jobs:
       - name: Install PyYAML for skill extraction
         run: pip install pyyaml==6.0.2 httpx==0.28.1
 
-      - name: Build skills index (unified multi-source catalog)
+      - name: Prepare skills index (unified multi-source catalog)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SKILLS_INDEX_RUN_ID: ${{ github.event.inputs.skills_index_run_id || '' }}
+          REBUILD_SKILLS_INDEX: ${{ github.event.inputs.rebuild_skills_index || 'false' }}
         run: |
           # Always rebuild — the file isn't committed (gitignored), so a
           # fresh checkout starts without it and we want the freshest crawl
