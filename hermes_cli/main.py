@@ -4900,13 +4900,42 @@ def _compute_desktop_content_hash(project_root: Path) -> str:
         h.update(b"\0")
 
 
-    from pathspec import PathSpec
-
     gitignore = project_root / ".gitignore"
     lines: list[str] = []
     if gitignore.is_file():
         lines = gitignore.read_text(encoding="utf-8").splitlines()
-    spec = PathSpec.from_lines("gitignore", lines)
+    try:
+        from importlib import import_module
+
+        PathSpec = import_module("pathspec").PathSpec
+        spec = PathSpec.from_lines("gitignore", lines)
+    except ImportError:
+        import fnmatch
+
+        class _BasicGitignoreSpec:
+            """Small fallback for desktop hashing before dependency repair runs."""
+
+            def __init__(self, patterns: list[str]) -> None:
+                self.patterns = [
+                    p.strip()
+                    for p in patterns
+                    if p.strip() and not p.lstrip().startswith("#")
+                ]
+
+            def match_file(self, rel: str) -> bool:
+                rel = rel.replace(os.sep, "/")
+                basename = os.path.basename(rel)
+                for pattern in self.patterns:
+                    pattern = pattern.rstrip("/")
+                    if not pattern:
+                        continue
+                    if "/" not in pattern and fnmatch.fnmatch(basename, pattern):
+                        return True
+                    if fnmatch.fnmatch(rel, pattern.lstrip("/")):
+                        return True
+                return False
+
+        spec = _BasicGitignoreSpec(lines)
 
     # Root workspace config
     for name in ("package.json", "package-lock.json"):
@@ -5113,6 +5142,90 @@ def _purge_electron_build_cache(desktop_dir: Path) -> list[Path]:
                 pass
 
     return removed
+
+
+def _electron_dist_binary(project_root: Path) -> Path:
+    """Return the path to the Electron main binary inside ``node_modules``.
+
+    electron-builder reads the binary from ``build.electronDist``
+    (``node_modules/electron/dist``) since #38673, so this is the exact file
+    whose absence makes a pack fail with "The specified electronDist does not
+    exist". The basename differs per OS (the platform Electron is named for the
+    host the build runs on).
+    """
+    dist = project_root / "node_modules" / "electron" / "dist"
+    if sys.platform == "darwin":
+        return dist / "Electron.app" / "Contents" / "MacOS" / "Electron"
+    if sys.platform == "win32":
+        return dist / "electron.exe"
+    return dist / "electron"
+
+
+def _electron_dist_ok(project_root: Path) -> bool:
+    """True when ``node_modules/electron/dist`` holds a usable Electron binary.
+
+    A directory that exists but is missing the binary (a partial extraction from
+    a corrupt cached zip, or an interrupted postinstall) counts as NOT ok, since
+    that is exactly the shape that makes electron-builder throw on the pinned
+    electronDist.
+    """
+    try:
+        return _electron_dist_binary(project_root).exists()
+    except OSError:
+        return False
+
+
+def _redownload_electron_dist(
+    project_root: Path,
+    env: dict,
+    *,
+    mirror: Optional[str] = None,
+) -> bool:
+    """(Re)populate ``node_modules/electron/dist`` via electron's own downloader.
+
+    Since #38673 the desktop build pins ``build.electronDist`` to
+    ``node_modules/electron/dist``, so electron-builder reads the Electron binary
+    straight from there and never downloads it during ``npm run pack``. That dist
+    tree is produced by the ``electron`` package's postinstall (``install.js``)
+    during ``npm ci``. When that download is blocked or throttled (GitHub's
+    release host is unreachable in some regions — #47266), the dist is missing
+    and re-running ``pack`` only re-throws "The specified electronDist does not
+    exist". The mirror fallback therefore has to drive *this* downloader, not
+    another ``pack``.
+
+    No-op (returns True) when the dist binary is already present, so an unrelated
+    build failure doesn't trigger a needless ~200 MB re-download. Otherwise drops
+    any partial dist + version marker (electron's install.js short-circuits when
+    ``path.txt`` already matches) and runs the downloader once, optionally via a
+    mirror. Best-effort: never raises. Returns True iff the dist binary exists
+    afterward.
+    """
+    if _electron_dist_ok(project_root):
+        return True
+
+    electron_dir = project_root / "node_modules" / "electron"
+    installer = electron_dir / "install.js"
+    if not installer.is_file():
+        return False
+    node = shutil.which("node")
+    if not node:
+        return False
+
+    dist_dir = electron_dir / "dist"
+    shutil.rmtree(dist_dir, ignore_errors=True)
+    try:
+        (electron_dir / "path.txt").unlink()
+    except OSError:
+        pass
+
+    dl_env = dict(env)
+    if mirror:
+        dl_env["ELECTRON_MIRROR"] = mirror
+    try:
+        subprocess.run([node, str(installer)], cwd=str(electron_dir), env=dl_env, check=False)
+    except OSError:
+        return False
+    return _electron_dist_ok(project_root)
 
 
 def _stop_desktop_processes_locking_build(desktop_dir: Path) -> list[int]:
@@ -5369,8 +5482,18 @@ def cmd_gui(args: argparse.Namespace):
                 # failure was something else, the clean re-download is harmless
                 # and the retry fails the same way.
                 purged = _purge_electron_build_cache(desktop_dir)
-                if purged:
-                    print("  ⚠ Desktop build failed; cleared cached Electron download and retrying once...")
+                # electronDist is pinned to node_modules/electron/dist (#38673):
+                # electron-builder reads the Electron binary from there and `pack`
+                # never downloads it, so purging the cache + re-running pack can't
+                # by itself repopulate a missing/partial dist. When the dist is
+                # actually gone, re-run electron's own downloader so the retry has
+                # a binary to read. Gated on the dist check so an unrelated build
+                # failure (tsc/vite) doesn't trigger a pointless ~200 MB refetch.
+                restored = False
+                if not _electron_dist_ok(PROJECT_ROOT):
+                    restored = _redownload_electron_dist(PROJECT_ROOT, env)
+                if purged or restored:
+                    print("  ⚠ Desktop build failed; refreshed the Electron download and retrying once...")
                     for p in purged:
                         print(f"    - {p}")
                     # The purge can't remove a win-unpacked tree whose Hermes.exe
@@ -5388,12 +5511,25 @@ def cmd_gui(args: argparse.Namespace):
                 # trade-off we only make AFTER the canonical GitHub download has
                 # failed, and we never override a user-pinned ELECTRON_MIRROR.
                 print("  ⚠ Desktop build still failing; the Electron download from "
-                      "GitHub looks blocked. Retrying once via a public mirror "
+                      "GitHub looks blocked. Re-downloading via a public mirror "
                       "(npmmirror.com)... (set ELECTRON_MIRROR to use another mirror)")
+                mirror = "https://npmmirror.com/mirrors/electron/"
                 mirror_env = dict(env)
-                mirror_env["ELECTRON_MIRROR"] = "https://npmmirror.com/mirrors/electron/"
-                _stop_desktop_processes_locking_build(desktop_dir)
-                build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=mirror_env, check=False)
+                mirror_env["ELECTRON_MIRROR"] = mirror
+                # electronDist is pinned (#38673), so `npm run pack` never
+                # downloads Electron — the mirror only helps if it drives
+                # electron's own downloader. Re-fetch the binary through the
+                # mirror first; otherwise the retry just re-reads the same missing
+                # dist and re-throws "electronDist does not exist" (#47266).
+                have_dist = _electron_dist_ok(PROJECT_ROOT)
+                if not have_dist:
+                    have_dist = _redownload_electron_dist(PROJECT_ROOT, env, mirror=mirror)
+                if have_dist:
+                    _stop_desktop_processes_locking_build(desktop_dir)
+                    build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=mirror_env, check=False)
+                else:
+                    print("  ✗ Could not re-download Electron from the mirror "
+                          "(node_modules/electron/dist still missing)")
             if build_result.returncode != 0:
                 print("✗ Desktop GUI build failed")
                 print(f"  Run manually:  cd apps/desktop && npm run {build_script}")
