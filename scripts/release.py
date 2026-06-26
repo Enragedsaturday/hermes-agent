@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "rebel@rebels-Mac-Studio-2.local": "rebel0789",  # PR #47308 salvage (redact browser_type typed text across display surfaces; #47197)
     "267614622+agt-user@users.noreply.github.com": "agt-user",  # PR #48496 salvage (telegram CLOSE-WAIT polling heartbeat, #48495)
     "80915+DavidMetcalfe@users.noreply.github.com": "DavidMetcalfe",  # PR #52272 salvage (route reasoning-model thinking-timeouts to timeout not context_overflow + reasoning-specific guidance; #52271)
     "8180647+herbalizer404@users.noreply.github.com": "herbalizer404",  # PR #49076 + #51835 salvage (auxiliary compression fallback: 403/session-usage payment errors + honor fallback chain when aux provider auth unavailable)
@@ -1644,7 +1645,7 @@ AUTHOR_MAP = {
     "mordred@inaugust.com": "emonty",
     "rodrigoeq@hotmail.com": "rodrigoeqnit",
     "soliva.johnpaul@icloud.com": "jonpol01",
-    "2182712990@qq.com": "yu-xin-c",  # PR #32122 (Docker audio bridge notes)
+    "2182712990@qq.com": "yu-xin-c",  # PR #51875 salvage (protect external_dirs skills from curator)
     "baxter@bitreserve.ai": "BaxBit",  # PR #30200 (Svix webhook signature validation)
     "chris.eth@qq.com": "duyua9",  # PR #10949 (render object config values structurally)
     "ethie@nous": "ethernet8023",  # PR #29342 (TUI clipboard copy on linux/wayland)
