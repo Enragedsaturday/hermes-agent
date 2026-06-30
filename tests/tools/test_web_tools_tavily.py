@@ -213,7 +213,7 @@ class TestWebExtractTavily:
         }
         mock_response.raise_for_status = MagicMock()
 
-        with patch("tools.web_tools._get_backend", return_value="tavily"), \
+        with patch("tools.web_tools._get_extract_backend", return_value="tavily"), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
              patch("tools.web_tools.httpx.post", return_value=mock_response), \
              patch("tools.web_tools.process_content_with_llm", return_value=None):
@@ -224,3 +224,4 @@ class TestWebExtractTavily:
             assert "results" in result
             assert len(result["results"]) == 1
             assert result["results"][0]["url"] == "https://example.com"
+            assert "Extracted content" in result["results"][0]["content"]

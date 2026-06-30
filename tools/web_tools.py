@@ -352,6 +352,7 @@ def _web_requires_env() -> list[str]:
 
 
 DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
+DEFAULT_EXTRACT_CHAR_LIMIT = 15000
 
 def _is_nous_auxiliary_client(client: Any) -> bool:
     """Return True when the resolved auxiliary backend is Nous Portal."""
@@ -792,6 +793,136 @@ def clean_base64_images(text: str) -> str:
     return cleaned_text
 
 
+def _get_extract_char_limit() -> int:
+    """Resolve the per-page char budget from config, clamped to a sane range."""
+    try:
+        configured = _load_web_config().get("extract_char_limit")
+        if configured is not None:
+            value = int(configured)
+            # Floor at 2k (below that the footer dominates), no hard ceiling
+            # beyond a generous guard so a typo can't blow up context.
+            return max(2000, min(value, 500_000))
+    except (TypeError, ValueError):
+        pass
+    return DEFAULT_EXTRACT_CHAR_LIMIT
+
+
+def convert_base64_images_to_links(text: str) -> str:
+    """Replace inline base64 image blobs with labeled markdown links.
+
+    base64 image payloads are token bombs (a single inline PNG can be tens of
+    thousands of characters), so we never send the raw bytes to the model. But
+    we preserve the fact that an image was there, and its alt text, as an
+    inspectable placeholder. Real (http/https) markdown image links are left
+    untouched so the agent can ``web_extract`` / ``vision_analyze`` them.
+
+    Transformations:
+      ``![alt](data:image/png;base64,AAAA...)``  -> ``[IMAGE: alt](base64 image omitted)``
+      ``(data:image/png;base64,AAAA...)``        -> ``[IMAGE]``
+      bare ``data:image/...;base64,AAAA...``     -> ``[IMAGE]``
+    """
+    # 1. Markdown image with base64 source -> keep alt text, drop the blob.
+    def _md_repl(m: "re.Match[str]") -> str:
+        alt = (m.group("alt") or "").strip()
+        return f"[IMAGE: {alt}]" if alt else "[IMAGE]"
+
+    md_b64 = re.compile(
+        r"!\[(?P<alt>[^\]]*)\]\(\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)"
+    )
+    out = md_b64.sub(_md_repl, text)
+
+    # 2. Parenthesised base64 (non-markdown) and 3. bare base64 -> [IMAGE].
+    out = re.sub(r"\(\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)", "[IMAGE]", out)
+    out = re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "[IMAGE]", out)
+    return out
+
+
+def _store_full_text(url: str, content: str) -> Optional[str]:
+    """Write the full extracted page to cache/web and return its absolute path.
+
+    The file is mounted read-only into remote backends (Docker/Modal/SSH) via
+    credential_files._CACHE_DIRS, so the agent's terminal/read_file tools can
+    page through the complete text on any backend. Returns None on failure
+    (storage is best-effort; truncated content is still returned to the model).
+    """
+    try:
+        import hashlib
+        from urllib.parse import urlparse
+        from hermes_constants import get_hermes_dir
+
+        cache_dir = get_hermes_dir("cache/web", "web_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        host = (urlparse(url).hostname or "page").replace(":", "_")
+        slug = re.sub(r"[^A-Za-z0-9._-]", "-", host)[:60].strip("-") or "page"
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+        path = cache_dir / f"{slug}-{digest}.md"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to store full web_extract text for %s: %s", url, exc)
+        return None
+
+
+def _truncate_with_footer(
+    content: str,
+    url: str,
+    char_limit: int,
+) -> tuple[str, bool]:
+    """Return (model_text, was_truncated) for one page's clean content.
+
+    Pages at or under ``char_limit`` are returned whole. Larger pages get a
+    head+tail window (~75% head / ~25% tail) cut on a markdown line boundary
+    where possible, plus an explicit footer telling the model exactly how much
+    it is seeing, where the full text is stored, and which read_file call pages
+    in the omitted middle. Deterministic — no model involvement.
+    """
+    if len(content) <= char_limit:
+        return content, False
+
+    head_budget = int(char_limit * 0.75)
+    tail_budget = char_limit - head_budget
+
+    head = content[:head_budget]
+    tail = content[-tail_budget:]
+    # Snap the head cut back to the last newline so we don't slice mid-line.
+    nl = head.rfind("\n")
+    if nl > head_budget * 0.5:
+        head = head[:nl]
+    # Snap the tail cut forward to the next newline for the same reason.
+    nl = tail.find("\n")
+    if 0 <= nl < tail_budget * 0.5:
+        tail = tail[nl + 1:]
+
+    total = len(content)
+    stored_path = _store_full_text(url, content)
+    shown = len(head) + len(tail)
+
+    footer_lines = [
+        "",
+        "─" * 8 + " [TRUNCATED] " + "─" * 8,
+        f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
+        f"of {total:,} total clean characters.",
+    ]
+    if stored_path:
+        footer_lines.append(f"Full text saved to: {stored_path}")
+        footer_lines.append(
+            f'To read the omitted middle: read_file path="{stored_path}" '
+            f"offset=<line> limit=<n>  (the file is the complete page)."
+        )
+    else:
+        footer_lines.append(
+            "Full text could not be stored; re-run web_extract on a more "
+            "specific URL or use browser_navigate for the complete page."
+        )
+    footer_lines.append("─" * 29)
+
+    model_text = head + "\n\n[... middle omitted — see footer ...]\n\n" + tail
+    model_text += "\n" + "\n".join(footer_lines)
+    return model_text, True
+
+
+
 # ─── Exa / Parallel inline helpers — moved into plugins ──────────────────────
 # After PR #25182, the exa client + search/extract and parallel client +
 # search/extract helpers all live in their respective plugins:
@@ -940,28 +1071,36 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 async def web_extract_tool(
     urls: List[str],
     format: str = None,
-    use_llm_processing: bool = True,
+    char_limit: Optional[int] = None,
+    use_llm_processing: bool = False,
     model: Optional[str] = None,
-    min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION
+    min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION,
 ) -> str:
     """
     Extract content from specific web pages using available extraction API backend.
 
-    This function provides a generic interface for web content extraction that
-    can work with multiple backends. Currently uses Firecrawl.
+    Returns clean page content (markdown/text) with NO LLM summarization. The
+    extract backends (Firecrawl, Tavily, Exa, Parallel) already return clean,
+    boilerplate-stripped content, so we return it directly and fast. Pages over
+    ``char_limit`` are head+tail truncated with an explicit footer; the full
+    text is stored under cache/web and the footer tells the model how to
+    read_file the omitted middle. Inline base64 images are replaced with
+    ``[IMAGE: alt]`` placeholders (real image URLs are preserved as links).
 
     Args:
         urls (List[str]): List of URLs to extract content from
         format (str): Desired output format ("markdown" or "html", optional)
-        use_llm_processing (bool): Whether to process content with LLM for summarization (default: True)
-        model (Optional[str]): The model to use for LLM processing (defaults to current auxiliary backend model)
-        min_length (int): Minimum content length to trigger LLM processing (default: 5000)
+        char_limit (Optional[int]): Per-page char budget sent to the model
+            (default: web.extract_char_limit or 15000). Larger pages truncate.
+        use_llm_processing/model/min_length: Deprecated compatibility knobs;
+            web_extract now returns deterministic clean text without LLM summarization.
 
     Security: URLs are checked for embedded secrets before fetching.
 
     Returns:
-        str: JSON string containing extracted content. If LLM processing is enabled and successful,
-             the 'content' field will contain the processed markdown summary instead of raw content.
+        str: JSON string with a ``results`` list; each entry has
+             ``url``, ``title``, ``content``, ``error``. ``content`` is the
+             (possibly truncated) clean page text.
 
     Raises:
         Exception: If extraction fails or API key is not set
@@ -990,16 +1129,14 @@ async def web_extract_tool(
         "parameters": {
             "urls": normalized_urls,
             "format": format,
-            "use_llm_processing": use_llm_processing,
-            "model": model,
-            "min_length": min_length
+            "char_limit": char_limit,
         },
         "error": None,
         "pages_extracted": 0,
-        "pages_processed_with_llm": 0,
+        "pages_truncated": 0,
         "original_response_size": 0,
         "final_response_size": 0,
-        "compression_metrics": [],
+        "truncation_metrics": [],
         "processing_applied": []
     }
 
@@ -1099,90 +1236,38 @@ async def web_extract_tool(
 
         debug_call_data["pages_extracted"] = pages_extracted
         debug_call_data["original_response_size"] = len(json.dumps(response))
-        effective_model = model or _get_default_summarizer_model()
-        auxiliary_available = check_auxiliary_model()
 
-        # Process each result with LLM if enabled
-        if use_llm_processing and auxiliary_available:
-            logger.info("Processing extracted content with LLM (parallel)...")
-            debug_call_data["processing_applied"].append("llm_processing")
+        effective_char_limit = char_limit if char_limit is not None else _get_extract_char_limit()
+        try:
+            effective_char_limit = max(2000, min(int(effective_char_limit), 500_000))
+        except (TypeError, ValueError):
+            effective_char_limit = DEFAULT_EXTRACT_CHAR_LIMIT
 
-            # Prepare tasks for parallel processing
-            async def process_single_result(result):
-                """Process a single result with LLM and return updated result with metrics."""
-                url = result.get('url', 'Unknown URL')
-                title = result.get('title', '')
-                raw_content = result.get('raw_content', '') or result.get('content', '')
-
-                if not raw_content:
-                    return result, None, "no_content"
-
-                original_size = len(raw_content)
-
-                # Process content with LLM
-                processed = await process_content_with_llm(
-                    raw_content, url, title, effective_model, min_length
-                )
-
-                if processed:
-                    processed_size = len(processed)
-                    compression_ratio = processed_size / original_size if original_size > 0 else 1.0
-
-                    # Update result with processed content
-                    result['content'] = processed
-                    result['raw_content'] = raw_content
-
-                    metrics = {
-                        "url": url,
-                        "original_size": original_size,
-                        "processed_size": processed_size,
-                        "compression_ratio": compression_ratio,
-                        "model_used": effective_model
-                    }
-                    return result, metrics, "processed"
-                else:
-                    metrics = {
-                        "url": url,
-                        "original_size": original_size,
-                        "processed_size": original_size,
-                        "compression_ratio": 1.0,
-                        "model_used": None,
-                        "reason": "content_too_short"
-                    }
-                    return result, metrics, "too_short"
-
-            # Run all LLM processing in parallel
-            results_list = response.get('results', [])
-            tasks = [process_single_result(result) for result in results_list]
-            # Use return_exceptions=True so a single task failure does not
-            # discard all other successfully processed results.
-            processed_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Collect metrics and print results
-            for result_item in processed_results:
-                if isinstance(result_item, BaseException):
-                    logger.warning("Web result processing task failed: %s", result_item)
-                    continue
-                result, metrics, status = result_item
-                url = result.get('url', 'Unknown URL')
-                if status == "processed":
-                    debug_call_data["compression_metrics"].append(metrics)
-                    debug_call_data["pages_processed_with_llm"] += 1
-                    logger.info("%s (processed)", url)
-                elif status == "too_short":
-                    debug_call_data["compression_metrics"].append(metrics)
-                    logger.info("%s (no processing - content too short)", url)
-                else:
-                    logger.warning("%s (no content to process)", url)
-        else:
-            if use_llm_processing and not auxiliary_available:
-                logger.warning("LLM processing requested but no auxiliary model available, returning raw content")
-                debug_call_data["processing_applied"].append("llm_processing_unavailable")
-            # Print summary of extracted pages for debugging (original behavior)
-            for result in response.get('results', []):
-                url = result.get('url', 'Unknown URL')
-                content_length = len(result.get('raw_content', ''))
-                logger.info("%s (%d characters)", url, content_length)
+        # Truncate-and-store: no LLM. For each result, convert inline base64
+        # images to labeled placeholders (keeping alt text + real image URLs),
+        # then return the clean content directly if within budget, or a
+        # head+tail window plus a footer pointing at the stored full text.
+        debug_call_data["processing_applied"].append("truncate_and_store")
+        for result in response.get("results", []):
+            if result.get("error"):
+                continue
+            url = result.get("url", "")
+            raw_content = result.get("raw_content", "") or result.get("content", "")
+            if not raw_content:
+                continue
+            clean = convert_base64_images_to_links(raw_content)
+            model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
+            result["content"] = model_text
+            if truncated:
+                debug_call_data["pages_truncated"] += 1
+                debug_call_data["truncation_metrics"].append({
+                    "url": url,
+                    "original_size": len(clean),
+                    "sent_size": len(model_text),
+                })
+                logger.info("%s (truncated %d -> %d chars)", url, len(clean), len(model_text))
+            else:
+                logger.info("%s (%d chars, whole)", url, len(clean))
 
         # Trim output to minimal fields per entry: title, content, error
         trimmed_results = [
@@ -1199,16 +1284,16 @@ async def web_extract_tool(
 
         if trimmed_response.get("results") == []:
             result_json = tool_error("Content was inaccessible or not found")
-
-            cleaned_result = clean_base64_images(result_json)
-
         else:
             result_json = json.dumps(trimmed_response, indent=2, ensure_ascii=False)
 
-            cleaned_result = clean_base64_images(result_json)
+        # base64 images were already converted to placeholders per-result above;
+        # this is a belt-and-suspenders sweep over the serialized JSON in case a
+        # provider tucked a blob somewhere unexpected (e.g. metadata).
+        cleaned_result = convert_base64_images_to_links(result_json)
 
         debug_call_data["final_response_size"] = len(cleaned_result)
-        debug_call_data["processing_applied"].append("base64_image_removal")
+        debug_call_data["processing_applied"].append("base64_image_conversion")
 
         # Log debug information
         _debug.log_call("web_extract_tool", debug_call_data)
@@ -1225,7 +1310,6 @@ async def web_extract_tool(
         _debug.save()
 
         return tool_error(error_msg)
-
 
 async def web_crawl_tool(
     url: str,

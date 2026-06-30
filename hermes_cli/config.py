@@ -1164,6 +1164,7 @@ DEFAULT_CONFIG = {
         # static HTML extraction. Paid scraper APIs (Firecrawl/Parallel/etc.)
         # should be explicit escalation, not the ordinary extraction path.
         "extract_backend": "local-browser",
+        "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
     },
 
     "browser": {
